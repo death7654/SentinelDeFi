@@ -18,6 +18,7 @@ if r"C:\hadoop\bin" not in os.environ.get("PATH", ""):
 DELTA_PACKAGE = "io.delta:delta-spark_2.12:3.2.0"  # must match get_spark_session()'s Scala version below
 DELTA_TABLE_PATH = "file:///C:/sentineldefi/delta/anomalies"
 HIVE_WAREHOUSE_DIR = "file:///C:/sentineldefi/hive-warehouse"
+CHECKPOINT_DIR = "file:///C:/sentineldefi/checkpoints/anomalies"
 
 # Schema for records written into the Delta anomaly table. This matches the
 # enriched_stream produced by streaming_engine.py: raw transaction fields,

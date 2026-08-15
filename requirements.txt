@@ -1,0 +1,24 @@
+# SentinelDeFi — Python dependencies
+#
+# Install with:
+#   pip install -r requirements.txt
+#
+# Note: this does NOT include the Delta Lake / Kafka *Spark* connector jars
+# (io.delta:delta-spark_2.12, org.apache.spark:spark-sql-kafka-0-10_2.12) —
+# those are JVM packages resolved automatically by Ivy at runtime via
+# spark.jars.packages in storage_layer.py / streaming_engine.py, not pip
+# packages. You do NOT need `pip install delta-spark` for this project,
+# since no script imports the `delta` python module directly.
+
+# --- Core pipeline (transaction_generator.py, streaming_engine.py,
+#     storage_layer.py, broadcast_engine.py, generate_wallet_profiles.py) ---
+pyspark==3.5.3          # must match the Scala 2.12 Delta/Kafka packages pinned in storage_layer.py
+kafka-python==2.0.2     # KafkaProducer in transaction_generator.py
+numpy==1.26.4           # exponential/uniform sampling in transaction_generator.py
+
+# --- inspect_data.py (standalone parquet/Delta reader, no Spark/JVM needed) ---
+pandas==2.2.2
+pyarrow==16.1.0
+deltalake==0.18.2       # optional but recommended: reads via _delta_log instead
+                         # of a naive glob over part-*.parquet — falls back
+                         # gracefully to the glob if this isn't installed

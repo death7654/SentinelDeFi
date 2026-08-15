@@ -14,6 +14,7 @@ from pyspark.sql.types import (
 # Pipeline Modules
 from broadcast_engine import join_with_profiles
 from storage_layer import (
+    CHECKPOINT_DIR,
     DELTA_PACKAGE,
     HIVE_WAREHOUSE_DIR,
     write_anomalies_batch,
@@ -112,8 +113,16 @@ anomalies_stream = (
 )
 
 # 9. Output Sink: Append Micro-Batches directly into Delta Lake
+# checkpointLocation is required for fault-tolerant recovery: it durably
+# records which Kafka offsets have been committed through foreachBatch,
+# so a crash/restart resumes exactly where it left off instead of either
+# reprocessing already-written anomalies or silently skipping data.
+# Without it Spark falls back to a throwaway temp directory that doesn't
+# survive a restart — this is what Module 3's fault-tolerance drill
+# (kill a worker mid-run, prove zero data loss) actually depends on.
 query = (
     anomalies_stream.writeStream.outputMode("append")
+    .option("checkpointLocation", CHECKPOINT_DIR)
     .foreachBatch(write_anomalies_batch)
     .start()
 )
