@@ -1,0 +1,68 @@
+### Python ###
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+*.egg
+
+### Generated project data — reproducible via the scripts, shouldn't be versioned ###
+wallet_profiles.csv
+*.snappy.parquet
+
+# Local staging dir referenced by storage_layer.py / broadcast_engine.py
+# (C:\sentineldefi) — only relevant if the repo ever lived at that path;
+# harmless to keep here as a guard either way.
+sentineldefi/
+
+### Spark / Hive / Delta Lake local state ###
+# Everything provision_hive_database()/provision_delta_anomaly_table() in
+# storage_layer.py creates under HIVE_WAREHOUSE_DIR / DELTA_TABLE_PATH.
+hive-warehouse/
+delta/
+spark-warehouse/
+metastore_db/
+derby.log
+checkpoints/
+_checkpoints/
+
+# Structured Streaming checkpoint locations, if/when one gets added to
+# streaming_engine.py's writeStream (not currently set, but common to add)
+**/checkpoint/
+
+### Ivy / Maven dependency resolution (spark.jars.packages) ###
+# Matches storage_layer.py / streaming_engine.py's dynamic package resolution
+# writing to C:\Users\<user>\.ivy2 — only relevant if that cache ever ends up
+# inside the repo directory instead of the user profile.
+.ivy2/
+ivy-cache/
+
+### Hadoop on Windows ###
+# C:\hadoop\logs referenced in streaming_engine.py's os.makedirs() call —
+# only matters if C:\hadoop ever ends up nested under the repo.
+hadoop/logs/
+winutils.exe
+
+### Docker ###
+# No compose overrides are currently tracked separately, but ignore local
+# override files if you ever add one for machine-specific tweaks.
+docker-compose.override.yml
+
+### IDE / OS noise ###
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+### Kafka (if ever run with a local, non-Docker broker) ###
+kafka-logs/
+zookeeper-data/
+
+### Secrets — none currently exist in this project, but guard against
+### anyone later adding a .env for RPC/API keys mentioned in the proposal
+.env
+.env.local

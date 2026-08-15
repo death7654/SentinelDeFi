@@ -1,7 +1,8 @@
 import os
 import pyspark
+import sys
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, from_json
+from pyspark.sql.functions import col, from_json, when
 from pyspark.sql.types import (
     DoubleType,
     StringType,
@@ -10,33 +11,54 @@ from pyspark.sql.types import (
     TimestampType,
 )
 
-# 1. Windows Native Hadoop Configuration
-# Explicitly set native environment variables so PySpark locates winutils & hadoop.dll
+# Pipeline Modules
+from broadcast_engine import join_with_profiles
+from storage_layer import (
+    DELTA_PACKAGE,
+    HIVE_WAREHOUSE_DIR,
+    write_anomalies_batch,
+)
+
+# 1. Windows Native Hadoop & Derby Log Configuration
+os.makedirs(r"C:\hadoop\logs", exist_ok=True)  # Prevents derby.log FileNotFoundException
 os.environ["HADOOP_HOME"] = r"C:\hadoop"
-os.environ["PATH"] += r";C:\hadoop\bin"
+if r"C:\hadoop\bin" not in os.environ.get("PATH", ""):
+    os.environ["PATH"] += r";C:\hadoop\bin"
 
-# 2. Dynamic Dependency Injection & Session Builder
+# 2. Force PySpark to use the exact active Python interpreter
+os.environ["PYSPARK_PYTHON"] = sys.executable
+os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
+
+# 2. Dynamic Package Dependency Resolution
 spark_version = pyspark.__version__
+kafka_package = f"org.apache.spark:spark-sql-kafka-0-10_2.12:{spark_version}"
+combined_packages = f"{DELTA_PACKAGE},{kafka_package}"
 
-# PySpark 4.x uses Scala 2.13 by default (_2.13)
-# Dynamically pull the exact artifact version matching the installed PySpark release
-kafka_package = f"org.apache.spark:spark-sql-kafka-0-10_2.13:{spark_version}"
-
+# 3. Spark Session with Hive, Delta Lake, and Kafka Support
 spark = (
     SparkSession.builder.appName("SentinelDeFi-Streaming")
-    .config("spark.jars.packages", kafka_package)
+    .config("spark.sql.warehouse.dir", HIVE_WAREHOUSE_DIR)
+    .config("spark.jars.packages", combined_packages)
+    .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+    .config(
+        "spark.sql.catalog.spark_catalog",
+        "org.apache.spark.sql.delta.catalog.DeltaCatalog",
+    )
+    .config(
+        "spark.driver.extraJavaOptions",
+        "-Dderby.stream.error.file=C:/hadoop/logs/derby.log",
+    )
+    .enableHiveSupport()
     .getOrCreate()
 )
 
-# Suppress noisy INFO log messages in console output
 spark.sparkContext.setLogLevel("WARN")
 
 print(
-    f"PySpark {spark_version} Structured Streaming Engine Started with {kafka_package}..."
+    f"PySpark {spark_version} Structured Streaming Engine Started with Delta + Kafka support..."
 )
 
-# 3. Schema Definition for DeFi Transactions
-# Matches the JSON payload emitted by the Kafka producer
+# 4. Input Transaction Schema Definition
 tx_schema = StructType(
     [
         StructField("tx_id", StringType(), True),
@@ -47,7 +69,7 @@ tx_schema = StructType(
     ]
 )
 
-# 4. Read Stream from Kafka
+# 5. Read Stream from Kafka
 raw_stream = (
     spark.readStream.format("kafka")
     .option("kafka.bootstrap.servers", "localhost:9092")
@@ -56,9 +78,7 @@ raw_stream = (
     .load()
 )
 
-# 5. Transformation Pipeline
-# Kafka sends raw binary payload in the 'value' column.
-# Cast binary -> String -> parse JSON according to defined Schema.
+# 6. Parse JSON Payload
 parsed_stream = (
     raw_stream.selectExpr("CAST(value AS STRING) as json_payload")
     .select(from_json(col("json_payload"), tx_schema).alias("data"))
@@ -71,13 +91,31 @@ parsed_stream = (
     )
 )
 
-# 6. Write Stream to Console (Micro-batch Sink)
+# 7. Broadcast Hash Join with Wallet Profiles
+enriched_stream = join_with_profiles(parsed_stream, spark)
+
+# 8. Filter and Tag Anomaly Events
+anomalies_stream = (
+    enriched_stream.withColumn(
+        "z_score",
+        when(col("amount_usd") >= 1_000_000, 5.0)
+        .when(col("gas_fee") >= 0.05, 3.5)
+        .otherwise(0.0),
+    )
+    .withColumn(
+        "anomaly_reason",
+        when(col("amount_usd") >= 1_000_000, "FLASH_LOAN_SPIKE")
+        .when(col("gas_fee") >= 0.05, "HIGH_GAS_BOT_BURST")
+        .otherwise(None),
+    )
+    .filter(col("anomaly_reason").isNotNull())
+)
+
+# 9. Output Sink: Append Micro-Batches directly into Delta Lake
 query = (
-    parsed_stream.writeStream.outputMode("append")
-    .format("console")
-    .option("truncate", "false")
+    anomalies_stream.writeStream.outputMode("append")
+    .foreachBatch(write_anomalies_batch)
     .start()
 )
 
-# Keep the streaming query active until interrupted (Ctrl + C)
 query.awaitTermination()
