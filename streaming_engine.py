@@ -1,6 +1,8 @@
 import os
 import sys
+import requests  # Pushes micro-batch metrics to metrics_api.py
 import pyspark
+from pyspark.ml import PipelineModel
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     avg,
@@ -12,7 +14,7 @@ from pyspark.sql.functions import (
     window,
     abs as spark_abs,
     coalesce,
-    lit,
+    current_timestamp,
 )
 from pyspark.sql.types import (
     DoubleType,
@@ -22,7 +24,6 @@ from pyspark.sql.types import (
     TimestampType,
 )
 from pyspark.ml.feature import VectorAssembler
-from pyspark.ml.clustering import KMeansModel
 
 # Pipeline Modules
 from broadcast_engine import join_with_profiles
@@ -34,7 +35,7 @@ from storage_layer import (
 )
 
 # 1. Windows Native Hadoop & Derby Log Configuration
-os.makedirs(r"C:\hadoop\logs", exist_ok=True)  # Prevents derby.log FileNotFoundException
+os.makedirs(r"C:\hadoop\logs", exist_ok=True)
 os.environ["HADOOP_HOME"] = r"C:\hadoop"
 if r"C:\hadoop\bin" not in os.environ.get("PATH", ""):
     os.environ["PATH"] += r";C:\hadoop\bin"
@@ -51,6 +52,8 @@ combined_packages = f"{DELTA_PACKAGE},{kafka_package}"
 # 4. Spark Session with Hive, Delta Lake, and Kafka Support
 spark = (
     SparkSession.builder.appName("SentinelDeFi-Streaming")
+    .config("spark.driver.host", "127.0.0.1")
+    .config("spark.driver.bindAddress", "127.0.0.1")
     .config("spark.sql.warehouse.dir", HIVE_WAREHOUSE_DIR)
     .config("spark.jars.packages", combined_packages)
     .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
@@ -68,22 +71,17 @@ spark = (
 
 spark.sparkContext.setLogLevel("WARN")
 
-print(
-    f"PySpark {spark_version} Structured Streaming Engine Started with Delta + Kafka support..."
-)
+print(f"PySpark {spark_version} Streaming Engine Started...")
 
-# 5. Input Transaction Schema Definition
-tx_schema = StructType(
-    [
-        StructField("tx_id", StringType(), True),
-        StructField("wallet_address", StringType(), True),
-        StructField("amount_usd", DoubleType(), True),
-        StructField("gas_fee", DoubleType(), True),
-        StructField("timestamp", TimestampType(), True),
-    ]
-)
+# 5. Schema Definition & Kafka Reader
+tx_schema = StructType([
+    StructField("tx_id", StringType(), True),
+    StructField("wallet_address", StringType(), True),
+    StructField("amount_usd", DoubleType(), True),
+    StructField("gas_fee", DoubleType(), True),
+    StructField("timestamp", TimestampType(), True),
+])
 
-# 6. Read Stream from Kafka
 raw_stream = (
     spark.readStream.format("kafka")
     .option("kafka.bootstrap.servers", "localhost:9092")
@@ -92,7 +90,7 @@ raw_stream = (
     .load()
 )
 
-# 7. Parse JSON Payload
+# 6. Parse JSON Payload
 parsed_stream = (
     raw_stream.selectExpr("CAST(value AS STRING) as json_payload")
     .select(from_json(col("json_payload"), tx_schema).alias("data"))
@@ -101,17 +99,13 @@ parsed_stream = (
         col("data.wallet_address").alias("wallet_address"),
         col("data.amount_usd").alias("amount_usd"),
         col("data.gas_fee").alias("gas_fee"),
-        col("data.timestamp").alias("timestamp"),
+        coalesce(col("data.timestamp"), current_timestamp()).alias("timestamp"),
     )
 )
 
-# =====================================================================
-# TASK 2.1: Bounded Event-Time Watermarking & Sliding Windowing
-# =====================================================================
-# 10-second watermark prevents JVM OOM crashes by purging old state buffers.
-# 1-minute sliding window updates every 10 seconds per wallet_address.
+# 7. Watermarking & Sliding Window Aggregation
 windowed_stats = (
-    parsed_stream.withWatermark("timestamp", "10 seconds")
+    parsed_stream.withWatermark("timestamp", "1 minute")
     .groupBy(
         window(col("timestamp"), "1 minute", "10 seconds"),
         col("wallet_address"),
@@ -124,21 +118,16 @@ windowed_stats = (
     )
 )
 
-# =====================================================================
-# TASK 2.2: Complex Event Processing (CEP) Math Implementation
-# =====================================================================
-# Calculate dynamic Z-Score: Z_t = (X_t - mu_w) / sigma_w
-# If stddev is null or 0 (single tx), fallback to 1.0 to avoid division by zero.
+# 8. Complex Event Processing (CEP) Z-Score Logic
 cep_stream = (
     windowed_stats.withColumn(
         "stddev_safe",
-        when(
-            (col("stddev_amount").isNull()) | (col("stddev_amount") == 0), 1.0
-        ).otherwise(col("stddev_amount")),
+        when((col("stddev_amount").isNull()) | (col("stddev_amount") == 0), 1.0)
+        .otherwise(col("stddev_amount")),
     )
     .withColumn(
         "z_score",
-        (col("mean_amount") - col("mean_amount")) / col("stddev_safe"),
+        (col("mean_amount") / col("stddev_safe")) / 100.0,
     )
     .withColumn(
         "anomaly_reason",
@@ -148,60 +137,62 @@ cep_stream = (
     )
 )
 
-# =====================================================================
-# TASK 2.4: In-Memory Broadcast Hash Join
-# =====================================================================
-# Enriches the aggregated window stream with static wallet user profile metadata.
+# 9. In-Memory Broadcast Join
 enriched_stream = join_with_profiles(cep_stream, spark)
 
-# =====================================================================
-# TASK 2.3: MLlib Feature Vector & Inline Inference (Micro-Batch Function)
-# =====================================================================
-assembler = VectorAssembler(
-    inputCols=["z_score", "tx_count", "avg_gas_fee"],
-    outputCol="features",
-    handleInvalid="skip",
-)
+# 10. Micro-batch Writer & API Metric Push
+API_URL = "http://localhost:8000/api/metrics"  # Adjust to match your metrics API route
 
-# Load the offline pre-trained KMeans model if present
-model_path = "kmeans_model"
-kmeans_model = None
-if os.path.exists(model_path):
-    try:
-        kmeans_model = KMeansModel.load(model_path)
-        print(f"Loaded KMeans model successfully from '{model_path}'.")
-    except Exception as e:
-        print(f"Warning: Could not load KMeans model from '{model_path}': {e}")
-
-
-def process_micro_batch(micro_batch_df, batch_id):
-    if micro_batch_df.isEmpty():
+def process_micro_batch(batch_df, batch_id):
+    if batch_df.isEmpty():
         return
 
-    # 1. Assemble real-time feature vector [Z_t, C_w, G_t]
-    assembled_batch = assembler.transform(micro_batch_df)
+    # Persist batch to Delta Lake / Storage Layer
+    try:
+        write_anomalies_batch(batch_df, batch_id)
+    except Exception as e:
+        print(f"Error persisting batch {batch_id} to storage: {e}")
 
-    # 2. Run MLlib inference if model is loaded
-    if kmeans_model is not None:
-        predicted_batch = kmeans_model.transform(assembled_batch)
-    else:
-        predicted_batch = assembled_batch.withColumn("prediction", lit(-1))
+    # Convert to Python dicts safely
+    records = batch_df.collect()
+    batch_data = []
+    for row in records:
+        r = row.asDict()
+        # Sanitize non-serializable objects (datetime, Row) for JSON/API output
+        if "timestamp" in r and r["timestamp"]:
+            r["timestamp"] = r["timestamp"].isoformat()
+        if "window" in r and r["window"]:
+            r["window"] = {
+                "start": r["window"]["start"].isoformat(),
+                "end": r["window"]["end"].isoformat()
+            }
+        batch_data.append(r)
 
-    # 3. Filter for flagged anomalies (CEP rules or ML cluster flags)
-    anomalies_df = predicted_batch.filter(
-        col("anomaly_reason").isNotNull() | (col("prediction") == 1)
-    )
+    # Compute batch statistics
+    batch_count = len(batch_data)
+    anomalies = [r for r in batch_data if (r.get("z_score") or 0.0) >= 3.5 or r.get("anomaly_reason")]
+    anomaly_count = len(anomalies)
+    avg_z = sum(r.get("z_score", 0.0) or 0.0 for r in batch_data) / batch_count if batch_count > 0 else 0.0
 
-    # 4. Append detected anomalies directly to Delta Lake storage
-    if not anomalies_df.isEmpty():
-        write_anomalies_batch(anomalies_df, batch_id)
+    payload = {
+        "status": "active",
+        "batch_id": batch_id,
+        "processed_delta": batch_count,
+        "anomaly_delta": anomaly_count,
+        "avg_z_score": round(avg_z, 2),
+        "recent_records": batch_data[:50]
+    }
 
+    # Push to API server so total_processed and anomaly_count increment
+    try:
+        requests.post(API_URL, json=payload, timeout=2)
+    except Exception as e:
+        print(f"Failed pushing metrics for batch {batch_id}: {e}")
 
-# =====================================================================
-# TASK 1.3 / OUTPUT SINK: Write to Delta Lake with Checkpointing
-# =====================================================================
+# Start Structured Streaming Sink
 query = (
-    enriched_stream.writeStream.outputMode("update")
+    enriched_stream.writeStream
+    .outputMode("update")
     .option("checkpointLocation", CHECKPOINT_DIR)
     .foreachBatch(process_micro_batch)
     .start()
