@@ -1,30 +1,60 @@
-version: '3.8'
+networks:
+  anomaly-net:
+    driver: bridge
 
 services:
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
-    container_name: defi-zookeeper
+    container_name: zookeeper
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
-    ports:
-      - "2181:2181"
+    networks:
+      - anomaly-net
 
   kafka:
     image: confluentinc/cp-kafka:7.5.0
-    container_name: defi-kafka
-    depends_on:
-      - zookeeper
+    container_name: kafka
     ports:
       - "9092:9092"
-      - "29092:29092"
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      # Expose Kafka to both local scripts and internal docker networks
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_HOST://kafka:29092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      # Automatically set default partitions to match your 6-core processing target
-      KAFKA_NUM_PARTITIONS: 6
+    depends_on:
+      - zookeeper
+    networks:
+      - anomaly-net
+
+  spark-master:
+    image: apache/spark:3.5.0
+    container_name: spark-master
+    command: /opt/spark/sbin/start-master.sh
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+    networks:
+      - anomaly-net
+
+  spark-worker:
+    image: apache/spark:3.5.0
+    container_name: spark-worker
+    command: /opt/spark/sbin/start-worker.sh spark://spark-master:7077
+    depends_on:
+      - spark-master
+    networks:
+      - anomaly-net
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_INSTALL_PLUGINS=yesoreyeram-infinity-datasource
+    networks:
+      - anomaly-net
