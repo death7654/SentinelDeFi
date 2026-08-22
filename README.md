@@ -13,8 +13,7 @@ Before starting the pipeline, ensure the following components are installed and 
 * Verify with:
   ```powershell
   java -version
-
-```
+  ```
 
 ### 2. Hadoop Binaries (`winutils` & `hadoop.dll`)
 
@@ -26,10 +25,7 @@ PySpark on Windows requires native Hadoop binaries to handle filesystem checkpoi
 ```powershell
 [System.Environment]::SetEnvironmentVariable("HADOOP_HOME", "C:\hadoop", "User")
 [System.Environment]::SetEnvironmentVariable("Path", $env:Path + ";C:\hadoop\bin", "User")
-
 ```
-
-
 
 ---
 
@@ -39,7 +35,6 @@ Install the required Python packages inside your virtual environment:
 
 ```powershell
 pip install pyspark kafka-python
-
 ```
 
 *(Note: The `spark-sql-kafka` connector JAR is dynamically downloaded by PySpark at runtime matching your exact PySpark version).*
@@ -57,10 +52,7 @@ Ensure your local Kafka broker is up and running on port `9092`.
 * **KRaft Mode (Kafka 3.x+):**
 ```powershell
 .\bin\windows\kafka-server-start.bat .\config\kraft\server.properties
-
 ```
-
-
 
 ---
 
@@ -70,14 +62,12 @@ Create the `defi-transactions` topic (if not already created):
 
 ```powershell
 .\bin\windows\kafka-topics.bat --create --topic defi-transactions --bootstrap-server localhost:9092 --partitions 6 --replication-factor 1
-
 ```
 
 To inspect partition offsets and active traffic:
 
 ```powershell
 .\bin\windows\kafka-topics.bat --describe --topic defi-transactions --bootstrap-server localhost:9092
-
 ```
 
 ---
@@ -88,7 +78,6 @@ Start your Kafka producer script to simulate incoming DeFi transaction streams:
 
 ```powershell
 python producer.py
-
 ```
 
 *Expected output:*
@@ -96,7 +85,6 @@ python producer.py
 ```text
 [+] Emitted tx: 0xcb70fb75... | Wallet: 0x0000...0005 | Amount: $715.52
 [+] Emitted tx: 0x1309e915... | Wallet: 0x0000...0004 | Amount: $421.71
-
 ```
 
 ---
@@ -107,7 +95,6 @@ In a new terminal window, start the streaming analysis pipeline:
 
 ```powershell
 python streaming_engine.py
-
 ```
 
 *Expected output:*
@@ -123,8 +110,26 @@ Batch: 0
 +----------------------------------+----------------------------------+----------+-------+--------------------------+
 |0xcb70fb75a4a9a2c3f829d733ea556de...|0x00000000000000000000000000000005|715.52    |0.0118 |2026-08-02 19:08:03.810916|
 +----------------------------------+----------------------------------+----------+-------+--------------------------+
-
 ```
+
+---
+
+### Step 5: Launch Metrics & Grafana Dashboard
+
+To monitor the real-time processing metrics, the monitoring launch script must be running:
+
+```powershell
+.\launch.ps1
+```
+
+Once running, the metrics endpoint will be available at:
+`http://host.docker.internal:8000/metrics/summary`
+
+**Grafana Integration:**
+When setting up your Grafana dashboard to track the pipeline throughput, use `total_processed` as the parsing agent. 
+
+You can configure a new Grafana panel directly via this URL:
+[Open Grafana New Panel Configuration](http://localhost:3000/dashboard/new?from=now-6h&to=now&timezone=browser&editPanel=1)
 
 ---
 
@@ -153,5 +158,3 @@ Incoming JSON byte payloads are deserialized using the following Spark schema:
 
 * **Cause:** Mismatch between installed `pyspark` package version and the requested Maven package (`spark-sql-kafka`).
 * **Fix:** `streaming_engine.py` dynamically resolves the artifact version using `pyspark.__version__` (`org.apache.spark:spark-sql-kafka-0-10_2.13:4.2.0`). Ensure you do not hardcode older versions like `3.5.0` or `4.0.0`.
-
-```

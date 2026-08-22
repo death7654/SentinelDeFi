@@ -66,3 +66,5 @@ zookeeper-data/
 ### anyone later adding a .env for RPC/API keys mentioned in the proposal
 .env
 .env.local
+
+/kmeans_model
