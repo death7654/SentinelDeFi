@@ -1,20 +1,20 @@
 import os
 import sys
-import requests  # Pushes micro-batch metrics to metrics_api.py
 import pyspark
 from pyspark.ml import PipelineModel
+from pyspark.ml.feature import VectorAssembler
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
+    abs as spark_abs,
     avg,
+    coalesce,
     col,
     count,
+    current_timestamp,
     from_json,
     stddev,
     when,
     window,
-    abs as spark_abs,
-    coalesce,
-    current_timestamp,
 )
 from pyspark.sql.types import (
     DoubleType,
@@ -23,7 +23,7 @@ from pyspark.sql.types import (
     StructType,
     TimestampType,
 )
-from pyspark.ml.feature import VectorAssembler
+import requests  # Pushes micro-batch metrics to metrics_api.py
 
 # Pipeline Modules
 from broadcast_engine import join_with_profiles
@@ -38,7 +38,7 @@ from storage_layer import (
 os.makedirs(r"C:\hadoop\logs", exist_ok=True)
 os.environ["HADOOP_HOME"] = r"C:\hadoop"
 if r"C:\hadoop\bin" not in os.environ.get("PATH", ""):
-    os.environ["PATH"] += r";C:\hadoop\bin"
+  os.environ["PATH"] += r";C:\hadoop\bin"
 
 # 2. Force PySpark to use the exact active Python interpreter
 os.environ["PYSPARK_PYTHON"] = sys.executable
@@ -49,11 +49,15 @@ spark_version = pyspark.__version__
 kafka_package = f"org.apache.spark:spark-sql-kafka-0-10_2.12:{spark_version}"
 combined_packages = f"{DELTA_PACKAGE},{kafka_package}"
 
-# 4. Spark Session with Hive, Delta Lake, and Kafka Support
+# 4. Spark Session with Hive, Delta Lake, and Schema Auto-Merge Enabled
+# 4. Spark Session with Hive, Delta Lake, and Dynamic Host Bindings
 spark = (
     SparkSession.builder.appName("SentinelDeFi-Streaming")
-    .config("spark.driver.host", "127.0.0.1")
+    .config("spark.driver.host", "localhost")
     .config("spark.driver.bindAddress", "127.0.0.1")
+    .config("spark.master", "local[*]")
+    .config("spark.network.timeout", "800s")
+    .config("spark.executor.heartbeatInterval", "60s")
     .config("spark.sql.warehouse.dir", HIVE_WAREHOUSE_DIR)
     .config("spark.jars.packages", combined_packages)
     .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
@@ -61,6 +65,7 @@ spark = (
         "spark.sql.catalog.spark_catalog",
         "org.apache.spark.sql.delta.catalog.DeltaCatalog",
     )
+    .config("spark.databricks.delta.schema.autoMerge.enabled", "true")
     .config(
         "spark.driver.extraJavaOptions",
         "-Dderby.stream.error.file=C:/hadoop/logs/derby.log",
@@ -122,8 +127,9 @@ windowed_stats = (
 cep_stream = (
     windowed_stats.withColumn(
         "stddev_safe",
-        when((col("stddev_amount").isNull()) | (col("stddev_amount") == 0), 1.0)
-        .otherwise(col("stddev_amount")),
+        when(
+            (col("stddev_amount").isNull()) | (col("stddev_amount") == 0), 1.0
+        ).otherwise(col("stddev_amount")),
     )
     .withColumn(
         "z_score",
@@ -141,58 +147,76 @@ cep_stream = (
 enriched_stream = join_with_profiles(cep_stream, spark)
 
 # 10. Micro-batch Writer & API Metric Push
-API_URL = "http://localhost:8000/api/metrics"  # Adjust to match your metrics API route
+API_URL = "http://localhost:8000/metrics/update"
+
+
+def sanitize_value(val):
+  """Recursively converts datetimes, timestamps, and nested dicts to JSON-safe formats."""
+  if hasattr(val, "isoformat"):
+    return val.isoformat()
+  elif isinstance(val, dict):
+    return {k: sanitize_value(v) for k, v in val.items()}
+  elif isinstance(val, list):
+    return [sanitize_value(v) for v in val]
+  return val
+
 
 def process_micro_batch(batch_df, batch_id):
-    if batch_df.isEmpty():
-        return
+  if batch_df.isEmpty():
+    return
 
-    # Persist batch to Delta Lake / Storage Layer
-    try:
-        write_anomalies_batch(batch_df, batch_id)
-    except Exception as e:
-        print(f"Error persisting batch {batch_id} to storage: {e}")
+  # Persist batch to Delta Lake / Storage Layer
+  try:
+    write_anomalies_batch(batch_df, batch_id)
+  except Exception as e:
+    print(f"Error persisting batch {batch_id} to storage: {e}")
 
-    # Convert to Python dicts safely
-    records = batch_df.collect()
-    batch_data = []
-    for row in records:
-        r = row.asDict()
-        # Sanitize non-serializable objects (datetime, Row) for JSON/API output
-        if "timestamp" in r and r["timestamp"]:
-            r["timestamp"] = r["timestamp"].isoformat()
-        if "window" in r and r["window"]:
-            r["window"] = {
-                "start": r["window"]["start"].isoformat(),
-                "end": r["window"]["end"].isoformat()
-            }
-        batch_data.append(r)
+  # Convert PySpark batch DataFrame to JSON-safe Python dictionaries
+  records = batch_df.collect()
+  batch_data = []
+  for row in records:
+    r = row.asDict(recursive=True)
+    # Recursively convert all datetime objects (first_seen_ts, window, timestamp)
+    r_clean = {k: sanitize_value(v) for k, v in r.items()}
+    batch_data.append(r_clean)
 
-    # Compute batch statistics
-    batch_count = len(batch_data)
-    anomalies = [r for r in batch_data if (r.get("z_score") or 0.0) >= 3.5 or r.get("anomaly_reason")]
-    anomaly_count = len(anomalies)
-    avg_z = sum(r.get("z_score", 0.0) or 0.0 for r in batch_data) / batch_count if batch_count > 0 else 0.0
+  # Compute batch statistics
+  batch_count = len(batch_data)
+  anomalies = [
+      r
+      for r in batch_data
+      if (r.get("z_score") or 0.0) >= 3.5 or r.get("anomaly_reason")
+  ]
+  anomaly_count = len(anomalies)
+  avg_z = (
+      sum(r.get("z_score", 0.0) or 0.0 for r in batch_data) / batch_count
+      if batch_count > 0
+      else 0.0
+  )
 
-    payload = {
-        "status": "active",
-        "batch_id": batch_id,
-        "processed_delta": batch_count,
-        "anomaly_delta": anomaly_count,
-        "avg_z_score": round(avg_z, 2),
-        "recent_records": batch_data[:50]
-    }
+  payload = {
+      "status": "active",
+      "batch_id": batch_id,
+      "processed_delta": batch_count,
+      "anomaly_delta": anomaly_count,
+      "avg_z_score": round(avg_z, 2),
+      "recent_records": batch_data[:50],
+  }
 
-    # Push to API server so total_processed and anomaly_count increment
-    try:
-        requests.post(API_URL, json=payload, timeout=2)
-    except Exception as e:
-        print(f"Failed pushing metrics for batch {batch_id}: {e}")
+  # Push to FastAPI metrics backend
+  try:
+    response = requests.post(API_URL, json=payload, timeout=2)
+    if response.status_code != 200:
+      print(
+          f"API returned status {response.status_code} for batch {batch_id}"
+      )
+  except Exception as e:
+    print(f"Failed pushing metrics for batch {batch_id}: {e}")
+
 
 # Start Structured Streaming Sink
 query = (
-    enriched_stream.writeStream
-    .outputMode("update")
+    enriched_stream.writeStream.outputMode("update")
     .option("checkpointLocation", CHECKPOINT_DIR)
     .foreachBatch(process_micro_batch)
     .start()
