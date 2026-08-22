@@ -111,26 +111,20 @@ def provision_delta_anomaly_table(spark):
 
 
 def write_anomalies_batch(anomalies_df, batch_id):
-    """
-    Pass this directly into a streaming query's foreachBatch, e.g. from
-    streaming_engine.py once the CEP/ML layer produces a filtered
-    anomalies DataFrame:
+  """Appends each micro-batch to the Delta table with automatic schema evolution."""
+  if anomalies_df.isEmpty():  # Native PySpark check (faster than .rdd.isEmpty())
+    return
 
-        anomalies_stream.writeStream.foreachBatch(write_anomalies_batch).start()
+  (
+      anomalies_df.write.format("delta")
+      .mode("append")
+      .option(
+          "mergeSchema", "true"
+      )  # Resolves [_LEGACY_ERROR_TEMP_DELTA_0007] schema mismatch errors
+      .save(DELTA_TABLE_PATH)
+  )
 
-    Appends each micro-batch to the Delta table. Delta's transaction
-    log (_delta_log) makes this append safe under concurrent readers
-    (e.g. Grafana querying the same table mid-write) — that's the ACID
-    guarantee the proposal calls out in section 2.5.
-    """
-    if anomalies_df.rdd.isEmpty():
-        return
-    (
-        anomalies_df.write.format("delta")
-        .mode("append")
-        .save(DELTA_TABLE_PATH)
-    )
-    print(f"[batch {batch_id}] wrote {anomalies_df.count()} anomalies to Delta.")
+  print(f"[batch {batch_id}] Wrote anomalies to Delta at {DELTA_TABLE_PATH}.")
 
 
 if __name__ == "__main__":
