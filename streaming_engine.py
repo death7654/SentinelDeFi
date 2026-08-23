@@ -1,8 +1,8 @@
+import json
 import os
 import sys
 import pyspark
 from pyspark.ml import PipelineModel
-from pyspark.ml.feature import VectorAssembler
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     abs as spark_abs,
@@ -12,6 +12,8 @@ from pyspark.sql.functions import (
     count,
     current_timestamp,
     from_json,
+    lit,
+    max as spark_max,
     stddev,
     when,
     window,
@@ -28,9 +30,16 @@ import requests  # Pushes micro-batch metrics to metrics_api.py
 # Pipeline Modules
 from broadcast_engine import join_with_profiles
 from storage_layer import (
+    ANOMALY_Z_THRESHOLD,
+    BOT_BURST_TX_COUNT_THRESHOLD,
     CHECKPOINT_DIR,
     DELTA_PACKAGE,
     HIVE_WAREHOUSE_DIR,
+    KAFKA_PACKAGE,
+    KMEANS_MODEL_META_PATH,
+    KMEANS_MODEL_PATH,
+    LARGE_TX_THRESHOLD_USD,
+    MIN_SAMPLES_FOR_ZSCORE,
     write_anomalies_batch,
 )
 
@@ -44,10 +53,10 @@ if r"C:\hadoop\bin" not in os.environ.get("PATH", ""):
 os.environ["PYSPARK_PYTHON"] = sys.executable
 os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
 
-# 3. Dynamic Package Dependency Resolution
-spark_version = pyspark.__version__
-kafka_package = f"org.apache.spark:spark-sql-kafka-0-10_2.12:{spark_version}"
-combined_packages = f"{DELTA_PACKAGE},{kafka_package}"
+# 3. Package Dependency Resolution — KAFKA_PACKAGE/DELTA_PACKAGE come from
+# storage_layer.py so this session and get_spark_session() can never load
+# mismatched connector jar versions.
+combined_packages = f"{DELTA_PACKAGE},{KAFKA_PACKAGE}"
 
 # 4. Spark Session with Hive, Delta Lake, and Schema Auto-Merge Enabled
 # 4. Spark Session with Hive, Delta Lake, and Dynamic Host Bindings
@@ -76,7 +85,7 @@ spark = (
 
 spark.sparkContext.setLogLevel("WARN")
 
-print(f"PySpark {spark_version} Streaming Engine Started...")
+print(f"PySpark {pyspark.__version__} Streaming Engine Started...")
 
 # 5. Schema Definition & Kafka Reader
 tx_schema = StructType([
@@ -118,12 +127,32 @@ windowed_stats = (
     .agg(
         avg("amount_usd").alias("mean_amount"),
         stddev("amount_usd").alias("stddev_amount"),
+        spark_max("amount_usd").alias("max_amount"),
         count("tx_id").alias("tx_count"),
         avg("gas_fee").alias("avg_gas_fee"),
     )
 )
 
-# 8. Complex Event Processing (CEP) Z-Score Logic
+# 8. Complex Event Processing (CEP) Anomaly Logic
+#
+# NOTE on z_score: this is intentionally a Grubbs'-test-style outlier
+# statistic — (max_amount - mean_amount) / stddev_amount, i.e. "how many
+# stddevs is the single largest transaction in this window from this
+# window's own mean" — not a z-score against an external baseline (no such
+# baseline exists in this pipeline; wallet_profiles has no $-amount stats
+# to compare against). This is only statistically meaningful with >=3
+# samples (Grubbs' test's own minimum-n requirement), which is why it's
+# gated on MIN_SAMPLES_FOR_ZSCORE below.
+#
+# Previously this computed mean_amount / stddev_safe / 100.0, which isn't
+# a z-score at all and blew up for tx_count == 1 windows (the common
+# case): stddev is null there, gets clamped to 1.0, so the "z-score"
+# degenerated to amount / 100 — meaning any transaction over ~$300 (which,
+# with amounts drawn from Exponential(scale=250), happens ~30% of the
+# time for completely normal traffic) tripped the anomaly threshold.
+# That single-count case is now handled separately by the explicit
+# LARGE_SINGLE_TRANSACTION rule below instead of being misdetected via a
+# meaningless "z-score".
 cep_stream = (
     windowed_stats.withColumn(
         "stddev_safe",
@@ -133,15 +162,73 @@ cep_stream = (
     )
     .withColumn(
         "z_score",
-        (col("mean_amount") / col("stddev_safe")) / 100.0,
+        (col("max_amount") - col("mean_amount")) / col("stddev_safe"),
     )
     .withColumn(
-        "anomaly_reason",
-        when(spark_abs(col("z_score")) > 3.0, "DYNAMIC_Z_SCORE_SPIKE")
-        .when(col("tx_count") > 8, "BOT_BURST_HIGH_FREQUENCY")
+        "rule_reason",
+        when(col("max_amount") > LARGE_TX_THRESHOLD_USD, "LARGE_SINGLE_TRANSACTION")
+        .when(
+            (col("tx_count") >= MIN_SAMPLES_FOR_ZSCORE)
+            & (spark_abs(col("z_score")) > ANOMALY_Z_THRESHOLD),
+            "DYNAMIC_Z_SCORE_SPIKE",
+        )
+        .when(col("tx_count") > BOT_BURST_TX_COUNT_THRESHOLD, "BOT_BURST_HIGH_FREQUENCY")
         .otherwise(None),
     )
 )
+
+# 8b. ML Anomaly Signal (KMeans, trained offline by train_kmeans.py)
+#
+# This is a second, learned signal layered on top of the rule-based CEP
+# checks above, not a replacement — it can catch windows that don't cross
+# any single hardcoded threshold but still cluster with historically
+# anomalous behavior across all three features (z_score, tx_count,
+# avg_gas_fee) jointly. anomaly_reason only falls back to the ML verdict
+# when no rule already fired, so the interpretable rule-based reasons
+# still take priority for reporting.
+#
+# The model is optional at runtime: if train_kmeans.py hasn't been run
+# yet, the pipeline degrades gracefully to rule-only detection instead of
+# crashing, and ml_cluster/ml_anomaly are still present in the output
+# schema (as nulls) so the Delta table schema doesn't change once someone
+# does train and load a model.
+ml_model = None
+ml_anomaly_clusters = []
+try:
+    ml_model = PipelineModel.load(KMEANS_MODEL_PATH)
+    with open(KMEANS_MODEL_META_PATH) as f:
+        meta = json.load(f)
+    ml_anomaly_clusters = meta["anomaly_clusters"]
+    print(
+        f"Loaded KMeans model from {KMEANS_MODEL_PATH} "
+        f"(anomaly clusters = {ml_anomaly_clusters}, normal cluster = {meta['normal_cluster']})"
+    )
+except Exception as e:
+    print(
+        f"[WARN] Could not load KMeans model/metadata from {KMEANS_MODEL_PATH} ({e}). "
+        f"Run train_kmeans.py first for ML-assisted detection. "
+        f"Continuing with rule-based detection only."
+    )
+
+if ml_model is not None:
+    ml_scored = (
+        ml_model.transform(cep_stream)
+        .withColumnRenamed("prediction", "ml_cluster")
+        .withColumn("ml_anomaly", col("ml_cluster").isin(ml_anomaly_clusters))
+        .drop("features", "scaledFeatures")
+    )
+else:
+    ml_scored = cep_stream.withColumn("ml_cluster", lit(None).cast("int")).withColumn(
+        "ml_anomaly", lit(False)
+    )
+
+cep_stream = ml_scored.withColumn(
+    "anomaly_reason",
+    coalesce(
+        col("rule_reason"),
+        when(col("ml_anomaly"), "ML_CLUSTER_ANOMALY"),
+    ),
+).drop("rule_reason")
 
 # 9. In-Memory Broadcast Join
 enriched_stream = join_with_profiles(cep_stream, spark)
@@ -181,12 +268,15 @@ def process_micro_batch(batch_df, batch_id):
     batch_data.append(r_clean)
 
   # Compute batch statistics
+  #
+  # An "anomaly" is anything the CEP layer above already tagged with an
+  # anomaly_reason. Previously this also re-checked z_score >= 3.5 here,
+  # a second, different threshold from the CEP layer's z_score > 3.0 —
+  # anomaly_reason is already a strict superset of that check, so the
+  # extra condition was redundant and just a second place for the
+  # threshold to drift out of sync.
   batch_count = len(batch_data)
-  anomalies = [
-      r
-      for r in batch_data
-      if (r.get("z_score") or 0.0) >= 3.5 or r.get("anomaly_reason")
-  ]
+  anomalies = [r for r in batch_data if r.get("anomaly_reason")]
   anomaly_count = len(anomalies)
   avg_z = (
       sum(r.get("z_score", 0.0) or 0.0 for r in batch_data) / batch_count

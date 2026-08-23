@@ -12,9 +12,17 @@
 
 # --- Core pipeline (transaction_generator.py, streaming_engine.py,
 #     storage_layer.py, broadcast_engine.py, generate_wallet_profiles.py) ---
-pyspark==3.5.3          # must match the Scala 2.12 Delta/Kafka packages pinned in storage_layer.py
+pyspark==3.5.3          # Scala 2.12 build; storage_layer.KAFKA_PACKAGE derives its version from
+                         # this at runtime, and DELTA_PACKAGE there is pinned to match Scala 2.12 too
 kafka-python==2.0.2     # KafkaProducer in transaction_generator.py
 numpy==1.26.4           # exponential/uniform sampling in transaction_generator.py
+requests==2.32.3        # streaming_engine.py pushes each micro-batch to metrics_api.py over HTTP
+
+# --- metrics_api.py (FastAPI service that streaming_engine.py pushes batch
+#     metrics to, and that Grafana's Infinity datasource polls for the live
+#     dashboard — see README "Live Grafana Dashboard") ---
+fastapi==0.115.0
+uvicorn==0.30.6          # run with: python -m uvicorn metrics_api:app --host 0.0.0.0 --port 8000
 
 # --- inspect_data.py (standalone parquet/Delta reader, no Spark/JVM needed) ---
 pandas==2.2.2

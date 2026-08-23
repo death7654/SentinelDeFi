@@ -68,3 +68,4 @@ zookeeper-data/
 .env.local
 
 /kmeans_model
+/kmeans_model_meta.json

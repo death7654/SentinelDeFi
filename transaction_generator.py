@@ -30,12 +30,24 @@ def make_payload(wallet, amount, gas_fee):
         "wallet_address": wallet,
         "amount_usd": max(1.0, float(amount)),
         "gas_fee": float(gas_fee),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        # timespec="milliseconds": Python's default isoformat() emits
+        # 6-digit microseconds (e.g. "...810916+00:00"), but Spark's
+        # default from_json timestamp pattern for TimestampType expects
+        # millisecond precision ("[.SSS]"). The mismatch didn't crash —
+        # from_json just silently returns null for "timestamp", and the
+        # coalesce(col("data.timestamp"), current_timestamp()) in
+        # streaming_engine.py masked it by substituting processing time —
+        # but that meant every event was silently using ingestion time
+        # instead of the actual emission time. Matching the precision here
+        # lets true event-time parse correctly.
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
     }
 
 
 def send(payload, tag):
-    producer.send('defi-transactions', value=payload)
+    producer.send('defi-transactions', value=payload).add_errback(
+        lambda exc: print(f"[{tag}] Kafka send failed: {exc}")
+    )
     print(f"[{tag}] {payload['wallet_address'][:10]}... | ${payload['amount_usd']:,.2f}")
 
 

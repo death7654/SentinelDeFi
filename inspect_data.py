@@ -101,6 +101,8 @@ def main():
                 "gas_fee",
                 "anomaly_reason",
                 "z_score",
+                "ml_cluster",
+                "ml_anomaly",
                 "historical_risk_tier",
                 "timestamp",
             ]
