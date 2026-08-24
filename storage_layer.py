@@ -16,6 +16,25 @@ os.environ.setdefault("HADOOP_HOME", r"C:\hadoop")
 if r"C:\hadoop\bin" not in os.environ.get("PATH", ""):
     os.environ["PATH"] += r";C:\hadoop\bin"
 
+# Pre-create every local directory Spark/Hive/Delta write into on Windows,
+# rather than assuming they exist:
+#   - C:\hadoop\logs: get_spark_session() points Derby's (the embedded Hive
+#     metastore's) log file here via spark.driver.extraJavaOptions. Derby
+#     won't create the directory itself — if it's missing, opening the log
+#     file fails immediately with a bare "The system cannot find the path
+#     specified.", with no further detail pointing at the real cause.
+#   - C:\sentineldefi\{hive-warehouse,delta\anomalies,checkpoints\anomalies}:
+#     match HIVE_WAREHOUSE_DIR / DELTA_TABLE_PATH / CHECKPOINT_DIR below.
+#     Spark/Delta will usually create these on first write, but creating
+#     them up front avoids any ordering surprises on a clean machine.
+for _dir in (
+    r"C:\hadoop\logs",
+    r"C:\sentineldefi\hive-warehouse",
+    r"C:\sentineldefi\delta\anomalies",
+    r"C:\sentineldefi\checkpoints\anomalies",
+):
+    os.makedirs(_dir, exist_ok=True)
+
 # Force PySpark's Python workers to use the exact active interpreter.
 # spark.createDataFrame() on a plain Python list (see
 # provision_delta_anomaly_table below) spawns a Python worker subprocess

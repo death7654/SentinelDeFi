@@ -340,7 +340,20 @@ The enriched output written to `sentineldefi.anomalies` (and pushed to
 * **Cause:** Windows' "App Execution Alias" stub for `python` intercepted a Spark-spawned Python worker subprocess. This happens whenever a Spark session doesn't pin `PYSPARK_PYTHON`/`PYSPARK_DRIVER_PYTHON` to the real interpreter — `spark.createDataFrame()` on a plain Python list (as `storage_layer.py` does to provision the empty Delta anomaly table) spawns a worker even with no UDFs involved.
 * **Fix:** already applied in `storage_layer.py`'s `get_spark_session()` (mirroring what `streaming_engine.py`/`train_kmeans.py` already did). If you still hit this elsewhere, you can also disable the alias yourself: **Settings → Apps → Advanced app settings → App execution aliases → turn off "python.exe"/"python3.exe"**.
 
-### 8. `streaming_engine.py` crashes on startup with a file-not-found / table-not-found error
+### 9. `storage_layer.py` fails immediately with `The system cannot find the path specified.`
+
+* **Cause:** `storage_layer.py` points Derby's (the embedded Hive metastore's) log file at `C:\hadoop\logs\derby.log` but didn't create that directory first — Derby doesn't create it for you, and fails to open the log file with this bare, generic-looking message.
+* **Fix:** already applied — `storage_layer.py` now creates `C:\hadoop\logs` before starting the Spark session, matching what `streaming_engine.py`/`train_kmeans.py` already did.
+
+### 11. `launch.ps1` reports `Detected JAVA_HOME: C:\Program Files\Common Files\Oracle\Java` and the next step fails with a bare `The system cannot find the path specified.`
+
+* **Cause:** Oracle's Java installer adds a `javapath` shim directory to `PATH` (commonly `C:\Program Files\Common Files\Oracle\Java\javapath`) containing just a `java.exe` stub — not a real JDK, no `bin`/`lib` structure. If that shim resolves ahead of your real JDK on `PATH`, naively walking up from `java.exe`'s location lands on a folder that isn't a JDK at all, so the next Spark session's JVM launch fails immediately with no Spark output.
+* **Fix:** `launch.ps1` now determines `JAVA_HOME` by asking the running JVM for its own `java.home` property (`java -XshowSettings:properties -version`) instead of guessing from `java.exe`'s path — this resolves correctly through the shim to your real JDK. If you still see a wrong path detected, set `JAVA_HOME` yourself before running the script:
+  ```powershell
+  [System.Environment]::SetEnvironmentVariable("JAVA_HOME", "C:\path\to\your\real\jdk-17", "User")
+  ```
+
+### 12. `streaming_engine.py` crashes on startup with a file-not-found / table-not-found error
 
 * **Cause:** `broadcast_engine.py` needs `wallet_profiles.csv` (or the Hive table) to already exist.
 * **Fix:** run `generate_wallet_profiles.py` and `storage_layer.py` first (Manual Step 3 above), or just use `launch.ps1`, which does this for you in the right order.

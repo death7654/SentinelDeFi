@@ -63,6 +63,10 @@ if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
     throw "python not found on PATH. Activate your virtual environment first."
 }
 
+$env:JAVA_HOME = "C:\Program Files\Java\jdk-17"
+$env:Path = "$env:JAVA_HOME\bin;" + $env:Path
+
+
 # Verify the Python packages the pipeline actually imports. requirements.txt
 # is the source of truth for versions — this just fails fast here, before
 # spawning windows, if `pip install -r requirements.txt` was never run.
@@ -83,21 +87,35 @@ if ($missingPackages.Count -gt 0) {
 
 # PySpark launches its JVM via JAVA_HOME, not just PATH — so even though
 # `java` already resolves correctly on PATH, PySpark can still fail to find
-# a JVM if JAVA_HOME is unset or points somewhere stale. Only set it if it's
-# missing or doesn't actually contain a java.exe, and derive it from
-# wherever `java` on PATH actually lives instead of hardcoding a guessed
-# install path (Oracle, Temurin/Adoptium, Zulu, etc. all install to
-# different locations, e.g. "C:\Program Files\Eclipse Adoptium\jdk-17...").
+# a JVM if JAVA_HOME is unset or points somewhere stale.
+#
+# We do NOT derive JAVA_HOME by walking up from wherever `java.exe` resolves
+# on PATH (e.g. "...\bin\java.exe" -> two levels up). On Windows that's
+# unreliable: Oracle's installer adds a "javapath" shim directory
+# (commonly "C:\Program Files\Common Files\Oracle\Java\javapath") containing
+# only java.exe/javaw.exe stubs with no "bin"/"lib" alongside them, and it's
+# often earlier on PATH than the real JDK. Walking up from that shim lands
+# on a folder that isn't a JDK at all, so Spark's JVM launch then fails with
+# a bare "The system cannot find the path specified." and no Spark output,
+# because java.exe under the guessed JAVA_HOME\bin never existed to run.
+#
+# Instead, ask the JVM that `java` on PATH actually launches for its own
+# real home via -XshowSettings:properties, which resolves correctly through
+# any shim/symlink regardless of how java.exe was found.
 $javaHomeValid = $env:JAVA_HOME -and (Test-Path (Join-Path $env:JAVA_HOME "bin\java.exe"))
 if (-not $javaHomeValid) {
-    $javaCmd = Get-Command java -ErrorAction SilentlyContinue
-    if ($javaCmd) {
-        # java.exe -> ...\<jdk-root>\bin\java.exe
-        $detectedJavaHome = Split-Path (Split-Path $javaCmd.Source -Parent) -Parent
-        $env:JAVA_HOME = $detectedJavaHome
-        Write-Host "  Detected JAVA_HOME: $env:JAVA_HOME" -ForegroundColor DarkGray
+    $javaProps = & java -XshowSettings:properties -version 2>&1
+    $javaHomeLine = $javaProps | Select-String "^\s*java\.home\s*="
+    if ($javaHomeLine) {
+        $detectedJavaHome = ($javaHomeLine.ToString() -replace ".*java\.home\s*=\s*", "").Trim()
+        if (Test-Path (Join-Path $detectedJavaHome "bin\java.exe")) {
+            $env:JAVA_HOME = $detectedJavaHome
+            Write-Host "  Detected JAVA_HOME: $env:JAVA_HOME" -ForegroundColor DarkGray
+        } else {
+            Write-Host "WARNING: java.home reported '$detectedJavaHome' but no bin\java.exe found there. PySpark will likely fail." -ForegroundColor Yellow
+        }
     } else {
-        Write-Host "WARNING: could not detect JAVA_HOME (java not found on PATH). PySpark will likely fail." -ForegroundColor Yellow
+        Write-Host "WARNING: could not determine JAVA_HOME from 'java -XshowSettings:properties'. PySpark will likely fail." -ForegroundColor Yellow
     }
 }
 if ($env:JAVA_HOME -and ($env:PATH -notlike "*$env:JAVA_HOME\bin*")) {
