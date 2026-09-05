@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>SentinelDeFi — Live Graph Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/vis-network@9.1.9/standalone/umd/vis-network.min.js"></script>
+<style>
+  :root {
+    --bg: #0b0e14;
+    --panel: #131722;
+    --border: #232838;
+    --text: #e6e9f0;
+    --muted: #8b93a7;
+    --accent: #5b8cff;
+    --danger: #ff5c7a;
+    --ok: #35d68a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+  header {
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: baseline;
+    gap: 16px;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  #status-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--muted); display: inline-block; margin-right: 6px;
+  }
+  #status-dot.live { background: var(--ok); }
+  main {
+    flex: 1;
+    display: grid;
+    grid-template-columns: 1fr 300px;
+    grid-template-rows: 1fr;
+    min-height: 0;
+  }
+  #network {
+    background: var(--bg);
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+  }
+  aside {
+    border-left: 1px solid var(--border);
+    padding: 16px;
+    overflow-y: auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+  }
+  .stat-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+  }
+  .stat {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+  }
+  .stat .value { font-size: 20px; font-weight: 700; }
+  .stat .label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.03em; }
+  h2 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em;
+    color: var(--muted); margin: 0 0 10px 0;
+  }
+  .ring-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--danger);
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin-bottom: 8px;
+    font-size: 12px;
+  }
+  .ring-card .ring-id { color: var(--danger); font-weight: 600; }
+  .wallet-row {
+    font-family: ui-monospace, "SF Mono", Consolas, monospace;
+    font-size: 11px;
+    color: var(--muted);
+    display: flex;
+    justify-content: space-between;
+    padding: 4px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .wallet-row .addr { color: var(--text); }
+  .empty { color: var(--muted); font-size: 12px; font-style: italic; }
+  .legend {
+    display: flex; flex-direction: column; gap: 6px; font-size: 11px; color: var(--muted);
+  }
+  .legend .swatch { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>SentinelDeFi — Live Graph</h1>
+  <div class="sub"><span id="status-dot"></span><span id="status-text">connecting to http://localhost:8000...</span></div>
+</header>
+
+<main>
+  <div id="network"></div>
+  <aside>
+    <section>
+      <h2>Pipeline</h2>
+      <div class="stat-grid">
+        <div class="stat"><div class="value" id="stat-processed">—</div><div class="label">Processed</div></div>
+        <div class="stat"><div class="value" id="stat-anomalies">—</div><div class="label">Anomalies</div></div>
+        <div class="stat"><div class="value" id="stat-wallets">—</div><div class="label">Wallets</div></div>
+        <div class="stat"><div class="value" id="stat-edges">—</div><div class="label">Edges</div></div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Detected Wash-Trading Rings</h2>
+      <div id="rings"><div class="empty">No rings detected yet.</div></div>
+    </section>
+
+    <section>
+      <h2>Top Risk Wallets</h2>
+      <div id="top-wallets"><div class="empty">Waiting for data...</div></div>
+    </section>
+
+    <section>
+      <h2>Legend</h2>
+      <div class="legend">
+        <div><span class="swatch" style="background:#5b8cff"></span>Normal wallet</div>
+        <div><span class="swatch" style="background:#ffcc4d"></span>High PageRank hub</div>
+        <div><span class="swatch" style="background:#ff5c7a"></span>Wash-trading ring member</div>
+        <div style="margin-top:4px; border-top:1px solid var(--border); padding-top:8px;">
+          <span style="display:inline-block;width:14px;height:2px;background:#2a3348;margin-right:6px;vertical-align:middle;"></span>Normal transaction
+        </div>
+        <div>
+          <span style="display:inline-block;width:14px;height:2px;background:#ff5c7a;margin-right:6px;vertical-align:middle;"></span>Flagged transaction
+        </div>
+      </div>
+    </section>
+  </aside>
+</main>
+
+<script>
+const API = "http://localhost:8000";
+const POLL_MS = 5000;
+
+const nodes = new vis.DataSet([]);
+const edges = new vis.DataSet([]);
+let hasFitOnce = false;
+const container = document.getElementById("network");
+const network = new vis.Network(container, { nodes, edges }, {
+  physics: { solver: "forceAtlas2Based", forceAtlas2Based: { gravitationalConstant: -60, springLength: 120 }, stabilization: false },
+  nodes: {
+    shape: "dot",
+    size: 12,
+    font: { color: "#8b93a7", size: 10 },
+    borderWidth: 2,
+  },
+  edges: {
+    color: { color: "#232838", highlight: "#5b8cff" },
+    arrows: { to: { enabled: true, scaleFactor: 0.4 } },
+    width: 1,
+    smooth: { type: "continuous" },
+  },
+  interaction: { hover: true, tooltipDelay: 100 },
+});
+
+function short(addr) {
+  if (!addr) return "unknown";
+  return addr.slice(0, 8) + "…" + addr.slice(-4);
+}
+
+function setStatus(ok, text) {
+  document.getElementById("status-dot").classList.toggle("live", ok);
+  document.getElementById("status-text").textContent = text;
+}
+
+async function fetchJSON(path) {
+  const res = await fetch(API + path);
+  if (!res.ok) throw new Error(`${path} -> ${res.status}`);
+  return res.json();
+}
+
+async function refresh() {
+  try {
+    const [summary, graphSummary, rings, topWallets, recentEdges] = await Promise.all([
+      fetchJSON("/metrics/summary"),
+      fetchJSON("/graph/summary"),
+      fetchJSON("/graph/wash-rings"),
+      fetchJSON("/graph/top-risk-wallets?limit=15"),
+      fetchJSON("/graph/recent-edges?limit=150"),
+    ]);
+
+    setStatus(true, `live — last batch ${summary.last_batch_id ?? "—"}`);
+
+    document.getElementById("stat-processed").textContent = summary.total_processed ?? 0;
+    document.getElementById("stat-anomalies").textContent = summary.total_anomalies ?? 0;
+    document.getElementById("stat-wallets").textContent = graphSummary.wallet_count ?? 0;
+    document.getElementById("stat-edges").textContent = graphSummary.edge_count ?? 0;
+
+    renderRings(rings);
+    renderTopWallets(topWallets);
+    renderGraph(topWallets, rings, recentEdges);
+  } catch (err) {
+    setStatus(false, `disconnected (${err.message}) — is metrics_api.py running?`);
+  }
+}
+
+function renderRings(data) {
+  const el = document.getElementById("rings");
+  const rings = data.rings || [];
+  if (!rings.length) {
+    el.innerHTML = '<div class="empty">No rings detected yet.</div>';
+    return;
+  }
+  el.innerHTML = rings.map(r => `
+    <div class="ring-card">
+      <div class="ring-id">Ring ${r.ring_id}</div>
+      ${r.wallets.map(w => `<div class="wallet-row"><span class="addr">${short(w)}</span></div>`).join("")}
+    </div>
+  `).join("");
+}
+
+function renderTopWallets(data) {
+  const el = document.getElementById("top-wallets");
+  const wallets = data.wallets || [];
+  if (!wallets.length) {
+    el.innerHTML = '<div class="empty">No graph analytics run yet — run graph_analytics.py.</div>';
+    return;
+  }
+  el.innerHTML = wallets.map(w => `
+    <div class="wallet-row">
+      <span class="addr">${short(w.wallet_address)}${w.in_wash_ring ? " ⚠" : ""}</span>
+      <span>${w.pagerank.toFixed(3)}</span>
+    </div>
+  `).join("");
+}
+
+function renderGraph(topWallets, ringsData, recentEdges) {
+  const ringAddresses = new Set(
+    (ringsData.rings || []).flatMap(r => r.wallets)
+  );
+  const rankedWallets = topWallets.wallets || [];
+  const edgeList = (recentEdges && recentEdges.edges) || [];
+
+  if (!rankedWallets.length && !edgeList.length) return;
+
+  const pagerankByAddr = new Map(rankedWallets.map(w => [w.wallet_address, w.pagerank]));
+  const maxPr = Math.max(...rankedWallets.map(w => w.pagerank), 0.0001);
+
+  // Node set = every wallet we have a PageRank for, UNION every address
+  // that shows up as an endpoint of a recent transaction — otherwise a
+  // wallet only ever seen as a transaction counterparty (e.g. one of the
+  // simulated DEX/lending contracts, which don't send transactions
+  // themselves and so never rank by PageRank as a *sender*) would have
+  // edges pointing at a node that doesn't exist, and vis-network would
+  // just silently drop that edge.
+  const addrSet = new Set(rankedWallets.map(w => w.wallet_address));
+  edgeList.forEach(e => { addrSet.add(e.from_wallet); addrSet.add(e.to_wallet); });
+
+  const nodeUpdates = Array.from(addrSet).map(addr => {
+    const inRing = ringAddresses.has(addr);
+    const pr = pagerankByAddr.get(addr);
+    const relPr = pr != null ? pr / maxPr : 0;
+    return {
+      id: addr,
+      label: short(addr),
+      color: inRing ? "#ff5c7a" : (relPr > 0.6 ? "#ffcc4d" : "#5b8cff"),
+      // Wallets with no PageRank yet (not enough graph_analytics.py history,
+      // or a receive-only address like a contract) still get drawn, just
+      // small and dim rather than omitted.
+      size: pr != null ? 10 + relPr * 20 : 8,
+      borderWidth: inRing ? 3 : 1,
+    };
+  });
+  nodes.update(nodeUpdates);
+
+  // Real transaction edges from Neo4j (see metrics_api.py's
+  // /graph/recent-edges) — this is the actual money-flow graph, not just
+  // the inferred ring hops the previous version drew. Anomalous edges
+  // (anomaly_reason set, by CEP rules or the Isolation Forest) are drawn
+  // in red and slightly thicker so a flagged transaction is visually
+  // distinct from ordinary traffic even outside a detected ring.
+  const edgeUpdates = edgeList.map(e => ({
+    id: `${e.from_wallet}->${e.to_wallet}->${e.timestamp}`,
+    from: e.from_wallet,
+    to: e.to_wallet,
+    color: { color: e.anomaly_reason ? "#ff5c7a" : "#2a3348" },
+    width: e.anomaly_reason ? 2 : 1,
+    title: e.anomaly_reason
+      ? `${e.anomaly_reason} — $${Number(e.amount_usd).toLocaleString()}`
+      : `$${Number(e.amount_usd).toLocaleString()}`,
+  }));
+  edges.clear();
+  edges.update(edgeUpdates);
+
+  // Fit the view once, the first time there's actually something to
+  // show — not on every poll, since re-fitting each refresh is exactly
+  // the "keeps jumping around" behavior that's annoying to look at.
+  if (!hasFitOnce && nodeUpdates.length > 0) {
+    network.once("stabilized", () => network.fit());
+    hasFitOnce = true;
+  }
+}
+
+refresh();
+setInterval(refresh, POLL_MS);
+</script>
+
+</body>
+</html>

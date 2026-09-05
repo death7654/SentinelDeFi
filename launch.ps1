@@ -1,48 +1,68 @@
 <#
-SentinelDeFi — full pipeline bootstrap (Windows / PowerShell)
+SentinelDeFi — full pipeline bootstrap (Windows / PowerShell), v2: Neo4j
+instead of Hive + Delta Lake.
 
 Run order:
-  1. docker-compose up -d          (Zookeeper + Kafka + Grafana)
-  2. Wait for the Kafka broker to accept connections
-  3. Create the defi-transactions topic (6 partitions, idempotent)
-  4. Generate synthetic wallet profiles + stage the CSV where
-     storage_layer.py expects it (C:\sentineldefi\wallet_profiles.csv)
-  5. Provision the Hive database + Delta Lake anomaly table
-  6. Sanity-check the broadcast hash join
-  7. Launch metrics_api.py (FastAPI/uvicorn) in its own window — this MUST
-     be up before streaming_engine.py starts pushing batch metrics to it,
-     and it's what Grafana polls for the live dashboard
-  8. Launch transaction_generator.py in its own window
-  9. Launch streaming_engine.py in its own window
+  0. Load .env (NEO4J_PASSWORD etc.) into the process environment
+  1. Check prerequisites (Java, winutils, Docker, Python packages)
+  2. Train the Isolation Forest model if isoforest_model.joblib doesn't
+     already exist (idempotent — safe to run every time)
+  3. docker-compose up -d          (Zookeeper + Kafka + Neo4j + Grafana)
+  4. Wait for the Kafka broker to accept connections
+  5. Wait for Neo4j's Bolt port to accept connections
+  6. Create the defi-transactions topic (6 partitions, idempotent)
+  7. Generate synthetic wallet profiles and load them into Neo4j
+  8. Sanity-check the broadcast hash join
+  9. Run graph_analytics.py once (so PageRank/betweenness/community/
+     embedding/wash-ring properties exist before the first streaming
+     batch reads them) and start a background loop to re-run it every
+     2 minutes for the rest of the session
+  10. Launch metrics_api.py (FastAPI/uvicorn) in its own window
+  11. Launch transaction_generator.py in its own window
+  12. Launch streaming_engine.py in its own window
 
-NOTE: this script does not train the KMeans model. Run `python
-train_kmeans.py` once beforehand (see README Step 4) — streaming_engine.py
-runs fine without it, but falls back to rule-based detection only.
+NOTE: graph_analytics.py (PageRank/betweenness/Louvain/FastRP/wash-ring
+detection) is a periodic job, not a streaming one — this script runs it
+once at startup and then starts a background loop that re-runs it every
+2 minutes for the rest of the session (see README "Keeping Graph
+Analytics Fresh").
 
 Usage (from the project root, in PowerShell):
     powershell -ExecutionPolicy Bypass -File launch.ps1
 #>
 
-# Deliberately NOT setting $ErrorActionPreference = "Stop" globally. Native
-# tools (java, docker, python) routinely write benign, expected output to
-# stderr — e.g. `java -version` prints its version string to stderr, not
-# stdout, even on a clean exit 0. With $ErrorActionPreference = "Stop",
-# PowerShell (both Windows PowerShell 5.1 and, unless
-# $PSNativeCommandUseErrorActionPreference is disabled, PowerShell 7.3+)
-# promotes that stderr text into a terminating exception regardless of
-# exit code, which would kill this script on the very first prerequisite
-# check. Instead, every native command below is followed by an explicit
-# $LASTEXITCODE check, which is what actually reflects success/failure.
+# Deliberately NOT setting $ErrorActionPreference = "Stop" globally — see
+# the original script's note: native tools routinely write benign,
+# expected output to stderr, so every native command below is followed by
+# an explicit $LASTEXITCODE check instead.
 
 $ProjectRoot = $PSScriptRoot
-$SentinelDataDir = "C:\sentineldefi"
 
 function Write-Step($msg) {
     Write-Host "`n==> $msg" -ForegroundColor Cyan
 }
 
 # ---------------------------------------------------------------------------
-# 0. Pre-flight checks
+# 0. Load .env (docker-compose reads this file itself; PowerShell doesn't,
+#    so this makes NEO4J_PASSWORD etc. available to the python scripts
+#    this same script launches below).
+# ---------------------------------------------------------------------------
+Write-Step "Loading .env"
+$envFile = Join-Path $ProjectRoot ".env"
+if (-not (Test-Path $envFile)) {
+    throw ".env not found. Copy .env.example to .env and set NEO4J_PASSWORD before running this script."
+}
+Get-Content $envFile | ForEach-Object {
+    if ($_ -match '^\s*([^#=\s][^=]*)\s*=\s*(.*)\s*$') {
+        [System.Environment]::SetEnvironmentVariable($matches[1], $matches[2], "Process")
+    }
+}
+if (-not $env:NEO4J_PASSWORD -or $env:NEO4J_PASSWORD -eq "change-me-before-running") {
+    throw "NEO4J_PASSWORD is unset or still the placeholder value in .env. Set a real password before running this script."
+}
+
+# ---------------------------------------------------------------------------
+# 1. Pre-flight checks
 # ---------------------------------------------------------------------------
 Write-Step "Checking prerequisites"
 
@@ -66,13 +86,7 @@ if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
 $env:JAVA_HOME = "C:\Program Files\Java\jdk-17"
 $env:Path = "$env:JAVA_HOME\bin;" + $env:Path
 
-
-# Verify the Python packages the pipeline actually imports. requirements.txt
-# is the source of truth for versions — this just fails fast here, before
-# spawning windows, if `pip install -r requirements.txt` was never run.
-# ("kafka" is the import name for the kafka-python package; "fastapi" /
-# "uvicorn" back metrics_api.py, which Grafana's live dashboard depends on.)
-$requiredPackages = @("pyspark", "kafka", "numpy", "requests", "fastapi", "uvicorn")
+$requiredPackages = @("pyspark", "kafka", "numpy", "requests", "fastapi", "uvicorn", "neo4j", "sklearn", "joblib", "dotenv")
 $missingPackages = @()
 foreach ($pkg in $requiredPackages) {
     python -c "import $pkg" 2>$null
@@ -85,23 +99,6 @@ if ($missingPackages.Count -gt 0) {
     Write-Host "         Install with: pip install -r requirements.txt" -ForegroundColor Yellow
 }
 
-# PySpark launches its JVM via JAVA_HOME, not just PATH — so even though
-# `java` already resolves correctly on PATH, PySpark can still fail to find
-# a JVM if JAVA_HOME is unset or points somewhere stale.
-#
-# We do NOT derive JAVA_HOME by walking up from wherever `java.exe` resolves
-# on PATH (e.g. "...\bin\java.exe" -> two levels up). On Windows that's
-# unreliable: Oracle's installer adds a "javapath" shim directory
-# (commonly "C:\Program Files\Common Files\Oracle\Java\javapath") containing
-# only java.exe/javaw.exe stubs with no "bin"/"lib" alongside them, and it's
-# often earlier on PATH than the real JDK. Walking up from that shim lands
-# on a folder that isn't a JDK at all, so Spark's JVM launch then fails with
-# a bare "The system cannot find the path specified." and no Spark output,
-# because java.exe under the guessed JAVA_HOME\bin never existed to run.
-#
-# Instead, ask the JVM that `java` on PATH actually launches for its own
-# real home via -XshowSettings:properties, which resolves correctly through
-# any shim/symlink regardless of how java.exe was found.
 $javaHomeValid = $env:JAVA_HOME -and (Test-Path (Join-Path $env:JAVA_HOME "bin\java.exe"))
 if (-not $javaHomeValid) {
     $javaProps = & java -XshowSettings:properties -version 2>&1
@@ -123,16 +120,33 @@ if ($env:JAVA_HOME -and ($env:PATH -notlike "*$env:JAVA_HOME\bin*")) {
 }
 
 # ---------------------------------------------------------------------------
-# 1. Start Kafka + Zookeeper
+# 2. Train the Isolation Forest model (idempotent — trains on synthetic
+#    data with a fixed random seed, so re-running produces the same
+#    model; skipped if isoforest_model.joblib already exists so restarts
+#    of the pipeline don't retrain from scratch every time for no reason)
 # ---------------------------------------------------------------------------
-Write-Step "Starting Zookeeper + Kafka (docker-compose up -d)"
+$modelPath = Join-Path $ProjectRoot "isoforest_model.joblib"
+if (Test-Path $modelPath) {
+    Write-Step "Isolation Forest model already exists, skipping training (delete isoforest_model.joblib to force a retrain)"
+} else {
+    Write-Step "Training Isolation Forest model (isoforest_model.joblib not found)"
+    python "$ProjectRoot\train_isolation_forest.py"
+    if ($LASTEXITCODE -ne 0) {
+        throw "train_isolation_forest.py failed (exit $LASTEXITCODE)."
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 3. Start Kafka + Zookeeper + Neo4j + Grafana
+# ---------------------------------------------------------------------------
+Write-Step "Starting Zookeeper + Kafka + Neo4j + Grafana (docker-compose up -d)"
 docker-compose -f "$ProjectRoot\docker-compose.yml" up -d
 if ($LASTEXITCODE -ne 0) {
     throw "docker-compose up -d failed (exit $LASTEXITCODE). Check Docker Desktop is running."
 }
 
 # ---------------------------------------------------------------------------
-# 2. Wait for Kafka to accept connections
+# 4. Wait for Kafka to accept connections
 # ---------------------------------------------------------------------------
 Write-Step "Waiting for Kafka broker to become ready"
 $maxRetries = 20
@@ -151,7 +165,25 @@ if (-not $ready) {
 }
 
 # ---------------------------------------------------------------------------
-# 3. Create the topic (idempotent)
+# 5. Wait for Neo4j's Bolt port to accept connections
+# ---------------------------------------------------------------------------
+Write-Step "Waiting for Neo4j to become ready"
+$neo4jReady = $false
+for ($i = 0; $i -lt 30; $i++) {
+    docker exec neo4j cypher-shell -u $env:NEO4J_USER -p $env:NEO4J_PASSWORD "RETURN 1" *> $null
+    if ($LASTEXITCODE -eq 0) {
+        $neo4jReady = $true
+        break
+    }
+    Write-Host "  Neo4j not ready yet, retrying in 2s... ($($i + 1)/30)"
+    Start-Sleep -Seconds 2
+}
+if (-not $neo4jReady) {
+    throw "Neo4j did not become ready in time. Check 'docker logs neo4j'."
+}
+
+# ---------------------------------------------------------------------------
+# 6. Create the topic (idempotent)
 # ---------------------------------------------------------------------------
 Write-Step "Creating defi-transactions topic (6 partitions)"
 docker exec kafka kafka-topics --create --if-not-exists `
@@ -165,7 +197,7 @@ if ($LASTEXITCODE -ne 0) {
 docker exec kafka kafka-topics --describe --topic defi-transactions --bootstrap-server localhost:9092
 
 # ---------------------------------------------------------------------------
-# 4. Generate wallet profiles + stage them where storage_layer.py expects them
+# 7. Generate wallet profiles and load them into Neo4j
 # ---------------------------------------------------------------------------
 Write-Step "Generating synthetic wallet profiles"
 python "$ProjectRoot\generate_wallet_profiles.py"
@@ -173,21 +205,14 @@ if ($LASTEXITCODE -ne 0) {
     throw "generate_wallet_profiles.py failed (exit $LASTEXITCODE)."
 }
 
-New-Item -ItemType Directory -Force -Path $SentinelDataDir | Out-Null
-Copy-Item -Force "$ProjectRoot\wallet_profiles.csv" "$SentinelDataDir\wallet_profiles.csv"
-Write-Host "  Staged wallet_profiles.csv -> $SentinelDataDir\wallet_profiles.csv"
-
-# ---------------------------------------------------------------------------
-# 5. Provision Hive database + Delta anomaly table
-# ---------------------------------------------------------------------------
-Write-Step "Provisioning Hive tables + Delta Lake anomaly table"
-python "$ProjectRoot\storage_layer.py"
+Write-Step "Loading wallet profiles into Neo4j (and provisioning schema)"
+python "$ProjectRoot\load_wallet_profiles.py"
 if ($LASTEXITCODE -ne 0) {
-    throw "storage_layer.py failed (exit $LASTEXITCODE). Check the JDK/winutils setup in README Prerequisites."
+    throw "load_wallet_profiles.py failed (exit $LASTEXITCODE)."
 }
 
 # ---------------------------------------------------------------------------
-# 6. Sanity-check the broadcast join
+# 8. Sanity-check the broadcast join
 # ---------------------------------------------------------------------------
 Write-Step "Verifying broadcast hash join"
 python "$ProjectRoot\broadcast_engine.py"
@@ -196,13 +221,20 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # ---------------------------------------------------------------------------
-# 7. Launch the metrics API (FastAPI/uvicorn) in its own window
+# 9. Run graph analytics once (PageRank / betweenness / Louvain / FastRP / wash-ring detection)
 # ---------------------------------------------------------------------------
-# This has to be up BEFORE streaming_engine.py starts writing micro-batches,
-# since process_micro_batch() posts to http://localhost:8000/metrics/update
-# on every batch. It's also what Grafana's Infinity datasource polls at
-# http://host.docker.internal:8000/metrics/summary for the live dashboard
-# (see README "Live Grafana Dashboard").
+Write-Step "Running initial graph analytics pass (PageRank, betweenness, Louvain, FastRP, wash-ring detection)"
+python "$ProjectRoot\graph_analytics.py"
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "WARNING: graph_analytics.py failed. Confirm the GDS plugin loaded (docker logs neo4j)." -ForegroundColor Yellow
+}
+
+Write-Step "Launching periodic graph analytics refresh (every 2 minutes) in a new window"
+Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd '$ProjectRoot'; while (`$true) { python graph_analytics.py; Start-Sleep -Seconds 120 }"
+
+# ---------------------------------------------------------------------------
+# 10. Launch the metrics API (FastAPI/uvicorn) in its own window
+# ---------------------------------------------------------------------------
 Write-Step "Launching metrics_api.py (FastAPI) in a new window"
 Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd '$ProjectRoot'; python -m uvicorn metrics_api:app --host 0.0.0.0 --port 8000"
 
@@ -226,7 +258,7 @@ if (-not $apiReady) {
 }
 
 # ---------------------------------------------------------------------------
-# 8. Launch the producer and the streaming engine in their own windows
+# 11. Launch the producer and the streaming engine in their own windows
 # ---------------------------------------------------------------------------
 Write-Step "Launching transaction_generator.py in a new window"
 Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd '$ProjectRoot'; python transaction_generator.py"
@@ -236,7 +268,12 @@ Start-Sleep -Seconds 2
 Write-Step "Launching streaming_engine.py in a new window"
 Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd '$ProjectRoot'; python streaming_engine.py"
 
-Write-Host "`nPipeline started. Three new windows are now running: metrics_api, the producer, and the streaming engine." -ForegroundColor Green
-Write-Host "  Metrics API:  http://localhost:8000/metrics/summary" -ForegroundColor Green
-Write-Host "  Grafana:      http://localhost:3000  (admin / admin)" -ForegroundColor Green
-Write-Host "  See README 'Live Grafana Dashboard' to wire up the Infinity datasource panel." -ForegroundColor Green
+Write-Host "`nPipeline started. Four new windows are now running: metrics_api, the producer, the streaming engine, and the periodic graph analytics refresh." -ForegroundColor Green
+Write-Host "  Metrics API:      http://localhost:8000/metrics/summary" -ForegroundColor Green
+Write-Host "  Graph summary:    http://localhost:8000/graph/summary" -ForegroundColor Green
+Write-Host "  Wash rings:       http://localhost:8000/graph/wash-rings" -ForegroundColor Green
+Write-Host "  Top risk wallets: http://localhost:8000/graph/top-risk-wallets" -ForegroundColor Green
+Write-Host "  Live dashboard:   open graph_dashboard.html directly in a browser" -ForegroundColor Green
+Write-Host "  Neo4j Browser:    http://localhost:7474  (see .env for credentials)" -ForegroundColor Green
+Write-Host "  Grafana:          http://localhost:3000  (admin / admin)" -ForegroundColor Green
+Write-Host "  Once some traffic has flowed, run 'python evaluate_model.py' for precision/recall against ground truth." -ForegroundColor Green

@@ -3,30 +3,32 @@
 # Install with:
 #   pip install -r requirements.txt
 #
-# Note: this does NOT include the Delta Lake / Kafka *Spark* connector jars
-# (io.delta:delta-spark_2.12, org.apache.spark:spark-sql-kafka-0-10_2.12) —
-# those are JVM packages resolved automatically by Ivy at runtime via
-# spark.jars.packages in storage_layer.py / streaming_engine.py, not pip
-# packages. You do NOT need `pip install delta-spark` for this project,
-# since no script imports the `delta` python module directly.
+# Note: this does NOT include the Kafka *Spark* connector jar
+# (org.apache.spark:spark-sql-kafka-0-10_2.12) — that's a JVM package
+# resolved automatically by Ivy at runtime via spark.jars.packages in
+# graph_storage.py / streaming_engine.py, not a pip package.
 
 # --- Core pipeline (transaction_generator.py, streaming_engine.py,
-#     storage_layer.py, broadcast_engine.py, generate_wallet_profiles.py) ---
-pyspark==3.5.3          # Scala 2.12 build; storage_layer.KAFKA_PACKAGE derives its version from
-                         # this at runtime, and DELTA_PACKAGE there is pinned to match Scala 2.12 too
-kafka-python==2.0.2     # KafkaProducer in transaction_generator.py
-numpy==1.26.4           # exponential/uniform sampling in transaction_generator.py
-requests==2.32.3        # streaming_engine.py pushes each micro-batch to metrics_api.py over HTTP
+#     graph_storage.py, broadcast_engine.py, generate_wallet_profiles.py) ---
+pyspark==3.5.3          # Scala 2.12 build; graph_storage.KAFKA_PACKAGE derives its version from this at runtime
+kafka-python==2.0.2      # KafkaProducer in transaction_generator.py
+numpy==1.26.4            # exponential/uniform sampling, Isolation Forest feature arrays
+requests==2.32.3         # streaming_engine.py pushes each micro-batch to metrics_api.py over HTTP
+
+# --- Storage backend: Neo4j (replaces deltalake/pyarrow's Hive+Delta role) ---
+neo4j==5.24.0             # official Bolt driver — graph_storage.py, broadcast_engine.py,
+                           # load_wallet_profiles.py, graph_analytics.py, inspect_data.py, metrics_api.py
+python-dotenv==1.0.1      # loads .env for NEO4J_PASSWORD — see .env.example
+
+# --- ML anomaly detection (replaces train_kmeans.py's PySpark MLlib KMeans) ---
+scikit-learn==1.5.2       # IsolationForest — train_isolation_forest.py, streaming_engine.py
+joblib==1.4.2             # serializes the fitted IsolationForest to isoforest_model.joblib
 
 # --- metrics_api.py (FastAPI service that streaming_engine.py pushes batch
 #     metrics to, and that Grafana's Infinity datasource polls for the live
 #     dashboard — see README "Live Grafana Dashboard") ---
 fastapi==0.115.0
-uvicorn==0.30.6          # run with: python -m uvicorn metrics_api:app --host 0.0.0.0 --port 8000
+uvicorn==0.30.6           # run with: python -m uvicorn metrics_api:app --host 0.0.0.0 --port 8000
 
-# --- inspect_data.py (standalone parquet/Delta reader, no Spark/JVM needed) ---
+# --- inspect_data.py (standalone Neo4j reader) ---
 pandas==2.2.2
-pyarrow==16.1.0
-deltalake==0.18.2       # optional but recommended: reads via _delta_log instead
-                         # of a naive glob over part-*.parquet — falls back
-                         # gracefully to the glob if this isn't installed

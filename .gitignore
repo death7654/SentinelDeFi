@@ -13,24 +13,21 @@ env/
 wallet_profiles.csv
 *.snappy.parquet
 
-# Local staging dir referenced by storage_layer.py / broadcast_engine.py
-# (C:\sentineldefi) — only relevant if the repo ever lived at that path;
-# harmless to keep here as a guard either way.
-sentineldefi/
+### Neo4j local state ###
+# docker-compose.yml's named volumes (neo4j_data/neo4j_logs) live inside
+# Docker, not the repo, but guard against anyone bind-mounting locally.
+neo4j-data/
+neo4j-logs/
 
-### Spark / Hive / Delta Lake local state ###
-# Everything provision_hive_database()/provision_delta_anomaly_table() in
-# storage_layer.py creates under HIVE_WAREHOUSE_DIR / DELTA_TABLE_PATH.
-hive-warehouse/
-delta/
+### Spark local state ###
 spark-warehouse/
 metastore_db/
 derby.log
+
+# Structured Streaming checkpoint location (streaming_engine.py writes
+# here — see checkpoints/neo4j_sink)
 checkpoints/
 _checkpoints/
-
-# Structured Streaming checkpoint locations, if/when one gets added to
-# streaming_engine.py's writeStream (not currently set, but common to add)
 **/checkpoint/
 
 ### Ivy / Maven dependency resolution (spark.jars.packages) ###
@@ -62,10 +59,20 @@ Thumbs.db
 kafka-logs/
 zookeeper-data/
 
-### Secrets — none currently exist in this project, but guard against
-### anyone later adding a .env for RPC/API keys mentioned in the proposal
+### Secrets ###
+# graph_storage.py loads NEO4J_PASSWORD from this via python-dotenv —
+# copy .env.example to .env locally, never commit the real file.
 .env
 .env.local
 
-/kmeans_model
-/kmeans_model_meta.json
+### Runtime state ###
+# metrics_api.py's persisted metrics store (see STATE_PATH) — reproducible
+# by running the pipeline, and would otherwise clutter every diff.
+metrics_state.json
+
+# evaluate_model.py's output — regenerate any time with `python evaluate_model.py`.
+eval_report.json
+
+### ML model artifacts — reproducible via train_isolation_forest.py ###
+/isoforest_model.joblib
+/isoforest_model_meta.json

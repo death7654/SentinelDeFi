@@ -1,8 +1,10 @@
 import json
 import os
 import sys
+
+import numpy as np
 import pyspark
-from pyspark.ml import PipelineModel
+import requests  # Pushes micro-batch metrics to metrics_api.py
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     abs as spark_abs,
@@ -11,10 +13,11 @@ from pyspark.sql.functions import (
     col,
     count,
     current_timestamp,
+    first,
     from_json,
-    lit,
-    max as spark_max,
     stddev,
+    sum as spark_sum,
+    max as spark_max,
     when,
     window,
 )
@@ -25,41 +28,36 @@ from pyspark.sql.types import (
     StructType,
     TimestampType,
 )
-import requests  # Pushes micro-batch metrics to metrics_api.py
 
 # Pipeline Modules
 from broadcast_engine import join_with_profiles
-from storage_layer import (
+from graph_storage import (
     ANOMALY_Z_THRESHOLD,
     BOT_BURST_TX_COUNT_THRESHOLD,
-    CHECKPOINT_DIR,
-    DELTA_PACKAGE,
-    HIVE_WAREHOUSE_DIR,
+    ISOFOREST_META_PATH,
+    ISOFOREST_MODEL_PATH,
     KAFKA_PACKAGE,
-    KMEANS_MODEL_META_PATH,
-    KMEANS_MODEL_PATH,
     LARGE_TX_THRESHOLD_USD,
     MIN_SAMPLES_FOR_ZSCORE,
-    write_anomalies_batch,
+    get_neo4j_driver,
+    write_transactions_batch,
 )
 
-# 1. Windows Native Hadoop & Derby Log Configuration
+# 1. Windows Native Hadoop Configuration (kept only because winutils is
+# still needed for Spark's own local shuffle/temp file handling on
+# Windows — Hive/Delta support itself is gone)
 os.makedirs(r"C:\hadoop\logs", exist_ok=True)
 os.environ["HADOOP_HOME"] = r"C:\hadoop"
 if r"C:\hadoop\bin" not in os.environ.get("PATH", ""):
-  os.environ["PATH"] += r";C:\hadoop\bin"
+    os.environ["PATH"] += r";C:\hadoop\bin"
 
 # 2. Force PySpark to use the exact active Python interpreter
 os.environ["PYSPARK_PYTHON"] = sys.executable
 os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
 
-# 3. Package Dependency Resolution — KAFKA_PACKAGE/DELTA_PACKAGE come from
-# storage_layer.py so this session and get_spark_session() can never load
-# mismatched connector jar versions.
-combined_packages = f"{DELTA_PACKAGE},{KAFKA_PACKAGE}"
-
-# 4. Spark Session with Hive, Delta Lake, and Schema Auto-Merge Enabled
-# 4. Spark Session with Hive, Delta Lake, and Dynamic Host Bindings
+# 3. Spark Session — Kafka only now. No warehouse dir, no Delta package,
+# no Hive support, no Derby log config: none of that exists anymore now
+# that the sink is Neo4j instead of a Spark-managed table.
 spark = (
     SparkSession.builder.appName("SentinelDeFi-Streaming")
     .config("spark.driver.host", "localhost")
@@ -67,32 +65,24 @@ spark = (
     .config("spark.master", "local[*]")
     .config("spark.network.timeout", "800s")
     .config("spark.executor.heartbeatInterval", "60s")
-    .config("spark.sql.warehouse.dir", HIVE_WAREHOUSE_DIR)
-    .config("spark.jars.packages", combined_packages)
-    .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
-    .config(
-        "spark.sql.catalog.spark_catalog",
-        "org.apache.spark.sql.delta.catalog.DeltaCatalog",
-    )
-    .config("spark.databricks.delta.schema.autoMerge.enabled", "true")
-    .config(
-        "spark.driver.extraJavaOptions",
-        "-Dderby.stream.error.file=C:/hadoop/logs/derby.log",
-    )
-    .enableHiveSupport()
+    .config("spark.jars.packages", KAFKA_PACKAGE)
     .getOrCreate()
 )
 
 spark.sparkContext.setLogLevel("WARN")
 
-print(f"PySpark {pyspark.__version__} Streaming Engine Started...")
+print(f"PySpark {pyspark.__version__} Streaming Engine Started (Neo4j sink)...")
 
-# 5. Schema Definition & Kafka Reader
+# 4. Schema Definition & Kafka Reader
+# `to_wallet` is new — without a counterparty, transactions had no graph
+# edge to write at all. See transaction_generator.py.
 tx_schema = StructType([
     StructField("tx_id", StringType(), True),
     StructField("wallet_address", StringType(), True),
+    StructField("to_wallet", StringType(), True),
     StructField("amount_usd", DoubleType(), True),
     StructField("gas_fee", DoubleType(), True),
+    StructField("true_label", StringType(), True),
     StructField("timestamp", TimestampType(), True),
 ])
 
@@ -104,55 +94,63 @@ raw_stream = (
     .load()
 )
 
-# 6. Parse JSON Payload
+# 5. Parse JSON Payload
 parsed_stream = (
     raw_stream.selectExpr("CAST(value AS STRING) as json_payload")
     .select(from_json(col("json_payload"), tx_schema).alias("data"))
     .select(
         col("data.tx_id").alias("tx_id"),
         col("data.wallet_address").alias("wallet_address"),
+        col("data.to_wallet").alias("to_wallet"),
         col("data.amount_usd").alias("amount_usd"),
         col("data.gas_fee").alias("gas_fee"),
+        col("data.true_label").alias("true_label"),
         coalesce(col("data.timestamp"), current_timestamp()).alias("timestamp"),
     )
 )
 
-# 7. Watermarking & Sliding Window Aggregation
+# 6. Watermarking & Sliding Window Aggregation
+#
+# Grouped by (window, wallet_address, to_wallet) now, not just (window,
+# wallet_address) — one aggregate row per *wallet pair* per window. This
+# is what lets each aggregate map directly onto one graph edge
+# (sender -> receiver) instead of losing the counterparty entirely, the
+# way the original per-wallet aggregation did. It's also a more useful
+# CEP unit: "this wallet burst-transacted against this specific
+# counterparty" is a stronger signal than "this wallet was busy" alone.
 windowed_stats = (
     parsed_stream.withWatermark("timestamp", "1 minute")
     .groupBy(
         window(col("timestamp"), "1 minute", "10 seconds"),
         col("wallet_address"),
+        col("to_wallet"),
     )
     .agg(
         avg("amount_usd").alias("mean_amount"),
         stddev("amount_usd").alias("stddev_amount"),
         spark_max("amount_usd").alias("max_amount"),
+        spark_sum("amount_usd").alias("total_amount_usd"),
         count("tx_id").alias("tx_count"),
         avg("gas_fee").alias("avg_gas_fee"),
+        first("tx_id").alias("sample_tx_id"),
+        # true_label is homogeneous within a (wallet, counterparty, window)
+        # group for every case the generator produces (a wash-trade hop
+        # and a bot-burst run each only ever hit one counterparty per
+        # wallet), so first() is exact here, not just a convenient
+        # approximation — see evaluate_model.py, which relies on this.
+        first("true_label").alias("true_label"),
+        spark_max("timestamp").alias("last_seen_ts"),
     )
+    .withColumn("window_start", col("window.start").cast("string"))
 )
 
-# 8. Complex Event Processing (CEP) Anomaly Logic
+# 7. Complex Event Processing (CEP) Anomaly Logic
 #
-# NOTE on z_score: this is intentionally a Grubbs'-test-style outlier
-# statistic — (max_amount - mean_amount) / stddev_amount, i.e. "how many
-# stddevs is the single largest transaction in this window from this
-# window's own mean" — not a z-score against an external baseline (no such
-# baseline exists in this pipeline; wallet_profiles has no $-amount stats
-# to compare against). This is only statistically meaningful with >=3
-# samples (Grubbs' test's own minimum-n requirement), which is why it's
-# gated on MIN_SAMPLES_FOR_ZSCORE below.
-#
-# Previously this computed mean_amount / stddev_safe / 100.0, which isn't
-# a z-score at all and blew up for tx_count == 1 windows (the common
-# case): stddev is null there, gets clamped to 1.0, so the "z-score"
-# degenerated to amount / 100 — meaning any transaction over ~$300 (which,
-# with amounts drawn from Exponential(scale=250), happens ~30% of the
-# time for completely normal traffic) tripped the anomaly threshold.
-# That single-count case is now handled separately by the explicit
-# LARGE_SINGLE_TRANSACTION rule below instead of being misdetected via a
-# meaningless "z-score".
+# z_score is a Grubbs'-test-style outlier statistic — (max_amount -
+# mean_amount) / stddev_amount for this (wallet, counterparty, window)
+# triple — only statistically meaningful with >=3 samples, gated on
+# MIN_SAMPLES_FOR_ZSCORE. See graph_storage.py for the threshold values
+# (unchanged from the original CEP design).
 cep_stream = (
     windowed_stats.withColumn(
         "stddev_safe",
@@ -177,137 +175,161 @@ cep_stream = (
     )
 )
 
-# 8b. ML Anomaly Signal (KMeans, trained offline by train_kmeans.py)
-#
-# This is a second, learned signal layered on top of the rule-based CEP
-# checks above, not a replacement — it can catch windows that don't cross
-# any single hardcoded threshold but still cluster with historically
-# anomalous behavior across all three features (z_score, tx_count,
-# avg_gas_fee) jointly. anomaly_reason only falls back to the ML verdict
-# when no rule already fired, so the interpretable rule-based reasons
-# still take priority for reporting.
-#
-# The model is optional at runtime: if train_kmeans.py hasn't been run
-# yet, the pipeline degrades gracefully to rule-only detection instead of
-# crashing, and ml_cluster/ml_anomaly are still present in the output
-# schema (as nulls) so the Delta table schema doesn't change once someone
-# does train and load a model.
-ml_model = None
-ml_anomaly_clusters = []
-try:
-    ml_model = PipelineModel.load(KMEANS_MODEL_PATH)
-    with open(KMEANS_MODEL_META_PATH) as f:
-        meta = json.load(f)
-    ml_anomaly_clusters = meta["anomaly_clusters"]
-    print(
-        f"Loaded KMeans model from {KMEANS_MODEL_PATH} "
-        f"(anomaly clusters = {ml_anomaly_clusters}, normal cluster = {meta['normal_cluster']})"
-    )
-except Exception as e:
-    print(
-        f"[WARN] Could not load KMeans model/metadata from {KMEANS_MODEL_PATH} ({e}). "
-        f"Run train_kmeans.py first for ML-assisted detection. "
-        f"Continuing with rule-based detection only."
-    )
-
-if ml_model is not None:
-    ml_scored = (
-        ml_model.transform(cep_stream)
-        .withColumnRenamed("prediction", "ml_cluster")
-        .withColumn("ml_anomaly", col("ml_cluster").isin(ml_anomaly_clusters))
-        .drop("features", "scaledFeatures")
-    )
-else:
-    ml_scored = cep_stream.withColumn("ml_cluster", lit(None).cast("int")).withColumn(
-        "ml_anomaly", lit(False)
-    )
-
-cep_stream = ml_scored.withColumn(
-    "anomaly_reason",
-    coalesce(
-        col("rule_reason"),
-        when(col("ml_anomaly"), "ML_CLUSTER_ANOMALY"),
-    ),
-).drop("rule_reason")
-
-# 9. In-Memory Broadcast Join
+# 8. Broadcast Join — pulls in historical wallet profile AND live graph
+# risk (PageRank / community / wash-ring flag from graph_analytics.py),
+# keyed on the sender (wallet_address). See broadcast_engine.py.
 enriched_stream = join_with_profiles(cep_stream, spark)
 
-# 10. Micro-batch Writer & API Metric Push
+# 9. ML Anomaly Signal (Isolation Forest — see train_isolation_forest.py)
+#
+# Loaded once at startup, same graceful-degradation behavior as the
+# original KMeans setup: if train_isolation_forest.py hasn't been run
+# yet, ml_score/ml_anomaly are just always None/False and the pipeline
+# falls back to rule-based detection only.
+ml_model = None
+ml_feature_cols = None
+ml_threshold = 0.0
+try:
+    import joblib
+
+    ml_model = joblib.load(ISOFOREST_MODEL_PATH)
+    with open(ISOFOREST_META_PATH) as f:
+        meta = json.load(f)
+    ml_feature_cols = meta["feature_cols"]
+    ml_threshold = meta["anomaly_score_threshold"]
+    print(f"Loaded Isolation Forest from {ISOFOREST_MODEL_PATH} "
+          f"(features={ml_feature_cols}, threshold={ml_threshold})")
+except Exception as e:
+    print(
+        f"[WARN] Could not load Isolation Forest model/metadata from "
+        f"{ISOFOREST_MODEL_PATH} ({e}). Run train_isolation_forest.py first "
+        f"for ML-assisted detection. Continuing with rule-based detection only."
+    )
+
+neo4j_driver = get_neo4j_driver()
+
 API_URL = "http://localhost:8000/metrics/update"
 
 
 def sanitize_value(val):
-  """Recursively converts datetimes, timestamps, and nested dicts to JSON-safe formats."""
-  if hasattr(val, "isoformat"):
-    return val.isoformat()
-  elif isinstance(val, dict):
-    return {k: sanitize_value(v) for k, v in val.items()}
-  elif isinstance(val, list):
-    return [sanitize_value(v) for v in val]
-  return val
+    """Recursively converts datetimes, timestamps, and nested dicts/rows
+    to JSON-safe formats."""
+    if hasattr(val, "isoformat"):
+        return val.isoformat()
+    elif isinstance(val, dict):
+        return {k: sanitize_value(v) for k, v in val.items()}
+    elif isinstance(val, list):
+        return [sanitize_value(v) for v in val]
+    return val
+
+
+def score_with_isolation_forest(batch_data):
+    """Scores every row in the batch with the Isolation Forest in one
+    vectorized call rather than row-by-row — cheap at these batch sizes,
+    and the natural way sklearn wants its input anyway. Mutates each row
+    dict in place, adding ml_score / ml_anomaly, and folds the verdict
+    into anomaly_reason when no rule already fired (rule-based reasons
+    still take priority, same precedence as the original KMeans setup)."""
+    if ml_model is None:
+        for row in batch_data:
+            row["ml_score"] = None
+            row["ml_anomaly"] = False
+            row["anomaly_reason"] = row.get("rule_reason")
+        return
+
+    X = np.array([
+        [
+            row.get("z_score") or 0.0,
+            row.get("tx_count") or 0,
+            row.get("avg_gas_fee") or 0.0,
+            row.get("graph_risk_score") or 0.0,
+            row.get("structural_novelty_score") or 0.0,
+        ]
+        for row in batch_data
+    ])
+    scores = ml_model.decision_function(X)
+
+    for row, score in zip(batch_data, scores):
+        row["ml_score"] = float(score)
+        row["ml_anomaly"] = bool(score < ml_threshold)
+        row["anomaly_reason"] = row.get("rule_reason") or (
+            "ML_ISOLATION_FOREST_ANOMALY" if row["ml_anomaly"] else None
+        )
 
 
 def process_micro_batch(batch_df, batch_id):
-  if batch_df.isEmpty():
-    return
+    if batch_df.isEmpty():
+        return
 
-  # Persist batch to Delta Lake / Storage Layer
-  try:
-    write_anomalies_batch(batch_df, batch_id)
-  except Exception as e:
-    print(f"Error persisting batch {batch_id} to storage: {e}")
+    records = batch_df.collect()
+    batch_data = []
+    for row in records:
+        r = row.asDict(recursive=True)
+        r_clean = {k: sanitize_value(v) for k, v in r.items()}
+        batch_data.append(r_clean)
 
-  # Convert PySpark batch DataFrame to JSON-safe Python dictionaries
-  records = batch_df.collect()
-  batch_data = []
-  for row in records:
-    r = row.asDict(recursive=True)
-    # Recursively convert all datetime objects (first_seen_ts, window, timestamp)
-    r_clean = {k: sanitize_value(v) for k, v in r.items()}
-    batch_data.append(r_clean)
+    score_with_isolation_forest(batch_data)
 
-  # Compute batch statistics
-  #
-  # An "anomaly" is anything the CEP layer above already tagged with an
-  # anomaly_reason. Previously this also re-checked z_score >= 3.5 here,
-  # a second, different threshold from the CEP layer's z_score > 3.0 —
-  # anomaly_reason is already a strict superset of that check, so the
-  # extra condition was redundant and just a second place for the
-  # threshold to drift out of sync.
-  batch_count = len(batch_data)
-  anomalies = [r for r in batch_data if r.get("anomaly_reason")]
-  anomaly_count = len(anomalies)
-  avg_z = (
-      sum(r.get("z_score", 0.0) or 0.0 for r in batch_data) / batch_count
-      if batch_count > 0
-      else 0.0
-  )
+    # Shape each row for graph_storage.write_transactions_batch: one row
+    # per (sender, receiver, window) aggregate = one SENT edge.
+    graph_rows = [
+        {
+            "tx_id": r.get("sample_tx_id"),
+            "window_start": r.get("window_start"),
+            "wallet_address": r["wallet_address"],
+            "to_wallet": r["to_wallet"],
+            "amount_usd": r.get("total_amount_usd"),
+            "gas_fee": r.get("avg_gas_fee"),
+            "tx_count": r.get("tx_count"),
+            "timestamp": r.get("last_seen_ts"),
+            "first_seen_ts": r.get("first_seen_ts"),
+            "historical_tx_count": r.get("historical_tx_count"),
+            "historical_risk_tier": r.get("historical_risk_tier"),
+            "true_label": r.get("true_label"),
+            "z_score": r.get("z_score"),
+            "anomaly_reason": r.get("anomaly_reason"),
+            "ml_score": r.get("ml_score"),
+            "ml_anomaly": r.get("ml_anomaly"),
+        }
+        for r in batch_data
+    ]
 
-  payload = {
-      "status": "active",
-      "batch_id": batch_id,
-      "processed_delta": batch_count,
-      "anomaly_delta": anomaly_count,
-      "avg_z_score": round(avg_z, 2),
-      "recent_records": batch_data[:50],
-  }
+    try:
+        write_transactions_batch(graph_rows, driver=neo4j_driver, batch_id=batch_id)
+    except Exception as e:
+        print(f"Error persisting batch {batch_id} to Neo4j: {e}")
 
-  # Push to FastAPI metrics backend
-  try:
-    response = requests.post(API_URL, json=payload, timeout=2)
-    if response.status_code != 200:
-      print(
-          f"API returned status {response.status_code} for batch {batch_id}"
-      )
-  except Exception as e:
-    print(f"Failed pushing metrics for batch {batch_id}: {e}")
+    # Compute batch statistics for the metrics API / Grafana feed.
+    batch_count = len(batch_data)
+    anomalies = [r for r in batch_data if r.get("anomaly_reason")]
+    anomaly_count = len(anomalies)
+    avg_z = (
+        sum(r.get("z_score", 0.0) or 0.0 for r in batch_data) / batch_count
+        if batch_count > 0
+        else 0.0
+    )
+
+    payload = {
+        "status": "active",
+        "batch_id": batch_id,
+        "processed_delta": batch_count,
+        "anomaly_delta": anomaly_count,
+        "avg_z_score": round(avg_z, 2),
+        "recent_records": batch_data[:50],
+    }
+
+    try:
+        response = requests.post(API_URL, json=payload, timeout=2)
+        if response.status_code != 200:
+            print(f"API returned status {response.status_code} for batch {batch_id}")
+    except Exception as e:
+        print(f"Failed pushing metrics for batch {batch_id}: {e}")
 
 
 # Start Structured Streaming Sink
 query = (
     enriched_stream.writeStream.outputMode("update")
-    .option("checkpointLocation", CHECKPOINT_DIR)
+    .option("checkpointLocation", os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints", "neo4j_sink"))
     .foreachBatch(process_micro_batch)
     .start()
 )

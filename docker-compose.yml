@@ -2,6 +2,10 @@ networks:
   anomaly-net:
     driver: bridge
 
+volumes:
+  neo4j_data:
+  neo4j_logs:
+
 services:
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
@@ -28,6 +32,35 @@ services:
     networks:
       - anomaly-net
 
+  # Replaces the Delta Lake / Hive storage layer. The Graph Data Science
+  # (GDS) plugin is what powers graph_analytics.py's PageRank/Louvain
+  # calls — it's not installed by default on the base Neo4j image, hence
+  # NEO4J_PLUGINS below.
+  neo4j:
+    image: neo4j:5.24-community
+    container_name: neo4j
+    ports:
+      - "7474:7474"  # Neo4j Browser (HTTP)
+      - "7687:7687"  # Bolt protocol — what graph_storage.py connects to
+    environment:
+      # docker-compose automatically reads a .env file in this same
+      # directory for ${...} substitution — copy .env.example to .env
+      # and set NEO4J_USER/NEO4J_PASSWORD there. graph_storage.py reads
+      # the same .env file (via python-dotenv), so the two can't drift.
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:?Set NEO4J_PASSWORD in .env — see .env.example}
+      NEO4J_PLUGINS: '["graph-data-science"]'
+      # GDS needs to be allow-listed to run its procedures.
+      NEO4J_dbms_security_procedures_unrestricted: gds.*
+      NEO4J_dbms_security_procedures_allowlist: gds.*
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    networks:
+      - anomaly-net
+
+  # Not used at runtime — streaming_engine.py runs Spark locally via
+  # local[*]. Left available in case you want to point the pipeline at a
+  # real cluster later (spark.master -> spark://spark-master:7077).
   spark-master:
     image: apache/spark:3.5.0
     container_name: spark-master
