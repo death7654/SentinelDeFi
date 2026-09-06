@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from graph_storage import get_neo4j_driver
+from graph_storage import RUNTIME_DIR, get_neo4j_driver
 
 app = FastAPI(title="SentinelDeFi Metrics API")
 
@@ -32,7 +32,7 @@ app.add_middleware(
 # A full database felt like overkill for a single small dict that's
 # already being updated at Kafka micro-batch cadence (a few seconds), not
 # per-request — a flat file is the right amount of infrastructure here.
-STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "metrics_state.json")
+STATE_PATH = os.path.join(RUNTIME_DIR, "metrics_state.json")
 
 DEFAULT_STATE: Dict[str, Any] = {
     "status": "initializing",
@@ -92,31 +92,6 @@ def update_metrics(payload: BatchMetricsPayload):
     _save_state(metrics_store)
     return {"status": "success", "batch_id": payload.batch_id}
 
-@app.get("/graph/recent-edges")
-def get_recent_edges(limit: int = 150):
-    """The most recent SENT relationships, for actually drawing the
-    transaction graph — /graph/top-risk-wallets and /graph/wash-rings
-    alone only give the dashboard *nodes*, never the real edges between
-    them, which is why the live graph view previously showed a scatter
-    of disconnected dots with no lines connecting them (the only "edges"
-    it had were ring-membership hops, not actual transactions)."""
-    driver = get_neo4j_driver()
-    with driver.session() as session:
-        result = session.run(
-            """
-            MATCH (sender:Wallet)-[r:SENT]->(receiver:Wallet)
-            RETURN sender.address AS from_wallet,
-                   receiver.address AS to_wallet,
-                   r.amount_usd AS amount_usd,
-                   coalesce(r.anomaly_reason, null) AS anomaly_reason,
-                   r.timestamp AS timestamp
-            ORDER BY r.timestamp DESC
-            LIMIT $limit
-            """,
-            limit=limit,
-        )
-        edges = [record.data() for record in result]
-    return {"edge_count": len(edges), "edges": edges}
 
 @app.get("/metrics/summary")
 def get_metrics_summary():
@@ -196,6 +171,33 @@ def get_top_risk_wallets(limit: int = 20):
         )
         wallets = [record.data() for record in result]
     return {"wallets": wallets}
+
+
+@app.get("/graph/recent-edges")
+def get_recent_edges(limit: int = 150):
+    """The most recent SENT relationships, for actually drawing the
+    transaction graph — /graph/top-risk-wallets and /graph/wash-rings
+    alone only give the dashboard *nodes*, never the real edges between
+    them, which is why the live graph view previously showed a scatter
+    of disconnected dots with no lines connecting them (the only "edges"
+    it had were ring-membership hops, not actual transactions)."""
+    driver = get_neo4j_driver()
+    with driver.session() as session:
+        result = session.run(
+            """
+            MATCH (sender:Wallet)-[r:SENT]->(receiver:Wallet)
+            RETURN sender.address AS from_wallet,
+                   receiver.address AS to_wallet,
+                   r.amount_usd AS amount_usd,
+                   coalesce(r.anomaly_reason, null) AS anomaly_reason,
+                   r.timestamp AS timestamp
+            ORDER BY r.timestamp DESC
+            LIMIT $limit
+            """,
+            limit=limit,
+        )
+        edges = [record.data() for record in result]
+    return {"edge_count": len(edges), "edges": edges}
 
 
 @app.get("/graph/summary")

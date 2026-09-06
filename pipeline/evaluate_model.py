@@ -26,10 +26,11 @@ Usage:
 """
 import argparse
 import json
+import os
 
 from sklearn.metrics import classification_report, confusion_matrix
 
-from graph_storage import get_neo4j_driver
+from graph_storage import RUNTIME_DIR, get_neo4j_driver
 
 
 def fetch_labeled_edges(driver, limit):
@@ -67,8 +68,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--limit", type=int, default=2000,
                          help="Max number of labeled SENT edges to evaluate (default 2000)")
-    parser.add_argument("--out", default="eval_report.json",
-                         help="Where to write the JSON report (default eval_report.json)")
+    parser.add_argument("--out", default=os.path.join(RUNTIME_DIR, "eval_report.json"),
+                         help="Where to write the JSON report (default runtime/eval_report.json)")
     args = parser.parse_args()
 
     driver = get_neo4j_driver()

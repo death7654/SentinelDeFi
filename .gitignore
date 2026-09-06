@@ -9,9 +9,18 @@ venv/
 env/
 *.egg
 
-### Generated project data — reproducible via the scripts, shouldn't be versioned ###
-wallet_profiles.csv
+### Generated project data — reproducible via pipeline/generate_wallet_profiles.py ###
+data/wallet_profiles.csv
 *.snappy.parquet
+
+### ML model artifacts — reproducible via pipeline/train_isolation_forest.py ###
+models/isoforest_model.joblib
+models/isoforest_model_meta.json
+
+### Runtime state — all reproducible by running the pipeline; this whole
+### folder is generated, nothing in it should ever be committed.
+runtime/*
+!runtime/.gitkeep
 
 ### Neo4j local state ###
 # docker-compose.yml's named volumes (neo4j_data/neo4j_logs) live inside
@@ -24,21 +33,15 @@ spark-warehouse/
 metastore_db/
 derby.log
 
-# Structured Streaming checkpoint location (streaming_engine.py writes
-# here — see checkpoints/neo4j_sink)
-checkpoints/
-_checkpoints/
-**/checkpoint/
-
 ### Ivy / Maven dependency resolution (spark.jars.packages) ###
-# Matches storage_layer.py / streaming_engine.py's dynamic package resolution
+# Matches graph_storage.py / streaming_engine.py's dynamic package resolution
 # writing to C:\Users\<user>\.ivy2 — only relevant if that cache ever ends up
 # inside the repo directory instead of the user profile.
 .ivy2/
 ivy-cache/
 
 ### Hadoop on Windows ###
-# C:\hadoop\logs referenced in streaming_engine.py's os.makedirs() call —
+# C:\hadoop\logs referenced in graph_storage.py's os.makedirs() call —
 # only matters if C:\hadoop ever ends up nested under the repo.
 hadoop/logs/
 winutils.exe
@@ -64,15 +67,3 @@ zookeeper-data/
 # copy .env.example to .env locally, never commit the real file.
 .env
 .env.local
-
-### Runtime state ###
-# metrics_api.py's persisted metrics store (see STATE_PATH) — reproducible
-# by running the pipeline, and would otherwise clutter every diff.
-metrics_state.json
-
-# evaluate_model.py's output — regenerate any time with `python evaluate_model.py`.
-eval_report.json
-
-### ML model artifacts — reproducible via train_isolation_forest.py ###
-/isoforest_model.joblib
-/isoforest_model_meta.json

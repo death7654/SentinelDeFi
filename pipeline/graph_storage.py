@@ -33,13 +33,30 @@ from neo4j import GraphDatabase
 from pyspark.sql import SparkSession
 import pyspark
 
-# Loads a local .env file if one exists (see .env.example). Every script
-# in this project imports graph_storage before touching Neo4j, so this is
-# the one place secrets get loaded from — nothing else should read
-# NEO4J_PASSWORD directly from os.environ without going through here.
-load_dotenv()
+# Secrets are loaded further below, once PROJECT_ROOT is known (see the
+# explicit load_dotenv() call after PROJECT_ROOT is computed).
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# graph_storage.py lives in <project root>/pipeline/ — everything that
+# isn't source code (models/, data/, runtime state) lives one level up
+# from here, in its own folder, so this is the one place that mapping is
+# defined. Every other module imports PROJECT_ROOT/MODELS_DIR/DATA_DIR/
+# RUNTIME_DIR from here rather than recomputing its own relative path,
+# so moving a folder only ever requires editing this file.
+PROJECT_ROOT = os.path.dirname(BASE_DIR)
+MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
+DATA_DIR = os.path.join(PROJECT_ROOT, "data")
+RUNTIME_DIR = os.path.join(PROJECT_ROOT, "runtime")
+os.makedirs(MODELS_DIR, exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(RUNTIME_DIR, exist_ok=True)
+
+# Explicit path rather than relying on load_dotenv()'s upward-search
+# default — that default does happen to work here too (it walks up from
+# this file's own directory, which finds the root .env either way), but
+# being explicit means it can't silently break if graph_storage.py ever
+# moves again.
+load_dotenv(dotenv_path=os.path.join(PROJECT_ROOT, ".env"))
 
 os.environ.setdefault("HADOOP_HOME", r"C:\hadoop")
 if r"C:\hadoop\bin" not in os.environ.get("PATH", ""):
@@ -78,8 +95,8 @@ if not NEO4J_PASSWORD:
     )
 
 # --- Model artifact paths (Isolation Forest — see train_isolation_forest.py) ---
-ISOFOREST_MODEL_PATH = os.path.join(BASE_DIR, "isoforest_model.joblib")
-ISOFOREST_META_PATH = os.path.join(BASE_DIR, "isoforest_model_meta.json")
+ISOFOREST_MODEL_PATH = os.path.join(MODELS_DIR, "isoforest_model.joblib")
+ISOFOREST_META_PATH = os.path.join(MODELS_DIR, "isoforest_model_meta.json")
 
 # --- Shared CEP thresholds (streaming_engine.py) -----------------------
 # Unchanged from storage_layer.py — the rule-based layer didn't need to

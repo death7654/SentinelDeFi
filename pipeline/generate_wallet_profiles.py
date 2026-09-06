@@ -1,21 +1,20 @@
 """
 Generates synthetic historical wallet baseline profiles used by the
-Week 7 Broadcast Hash Join. In production this table would come from
-real historical on-chain analytics; here we fabricate a small lookup
-table with the same shape so the join logic can be built and tested
-now, ahead of Week 7.
+broadcast hash join. In production this table would come from real
+historical on-chain analytics; here we fabricate a small lookup table
+with the same shape so the join logic can be built and tested.
 
-Run this once, then run storage_layer.py to register the output as
-a Hive table.
+Run this once, then run load_wallet_profiles.py to load the output into
+Neo4j.
 """
 import csv
 import os
 import random
 from datetime import datetime, timedelta, timezone
 
-# Resolve the absolute path of the current directory
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-OUTPUT_PATH = os.path.join(BASE_DIR, "wallet_profiles.csv")
+from graph_storage import DATA_DIR
+
+OUTPUT_PATH = os.path.join(DATA_DIR, "wallet_profiles.csv")
 
 WALLETS = [f"0x{i:040x}" for i in range(1, 11)]
 RISK_TIERS = ["low", "medium", "high"]

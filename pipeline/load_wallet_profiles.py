@@ -12,10 +12,9 @@ step (re-run any time you regenerate wallet_profiles.csv).
 import csv
 import os
 
-from graph_storage import get_neo4j_driver, init_graph_schema
+from graph_storage import DATA_DIR, get_neo4j_driver, init_graph_schema
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_CSV_PATH = os.path.join(BASE_DIR, "wallet_profiles.csv")
+DEFAULT_CSV_PATH = os.path.join(DATA_DIR, "wallet_profiles.csv")
 
 
 def load_profiles(csv_path=DEFAULT_CSV_PATH, driver=None):

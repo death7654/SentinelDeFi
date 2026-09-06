@@ -39,6 +39,7 @@ from graph_storage import (
     KAFKA_PACKAGE,
     LARGE_TX_THRESHOLD_USD,
     MIN_SAMPLES_FOR_ZSCORE,
+    RUNTIME_DIR,
     get_neo4j_driver,
     write_transactions_batch,
 )
@@ -329,7 +330,7 @@ def process_micro_batch(batch_df, batch_id):
 # Start Structured Streaming Sink
 query = (
     enriched_stream.writeStream.outputMode("update")
-    .option("checkpointLocation", os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints", "neo4j_sink"))
+    .option("checkpointLocation", os.path.join(RUNTIME_DIR, "checkpoints", "neo4j_sink"))
     .foreachBatch(process_micro_batch)
     .start()
 )

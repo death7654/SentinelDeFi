@@ -49,6 +49,8 @@ are not designed to run at streaming micro-batch latency.
 """
 import argparse
 
+from neo4j import Query
+
 from graph_storage import get_neo4j_driver
 
 # Kept small on purpose: this project's synthetic graph tops out at a few
@@ -66,6 +68,12 @@ GRAPH_NAME = "sentineldefi-tx-graph"
 # combinatorial blowup of searching arbitrarily long cycles on every run.
 MIN_RING_LENGTH = 3
 MAX_RING_LENGTH = 8
+
+# Safety net for the cycle-detection query below — see detect_wash_rings()
+# for why this shouldn't normally be needed once the dedup step is in
+# place, but a query that runs away for any other reason (an unusually
+# large graph, a future change to the query) shouldn't be able to hang
+# the periodic refresh loop indefinitely.
 CYCLE_QUERY_TIMEOUT_SECONDS = 30
 
 
@@ -161,17 +169,52 @@ def run_louvain(session):
         """
     )
 
+
 def detect_wash_rings(session):
-    """... (see comment in the function for the full explanation) ..."""
+    """Plain Cypher cycle detection (GDS community edition has no
+    dedicated cycle-finding algorithm) — finds directed trails that
+    start and end at the same wallet, 3 to 8 hops long. This is the
+    structural counterpart to the CEP layer's velocity-based
+    wash-trading heuristic: CEP asks "is this wallet transacting
+    suspiciously often", this asks "do these transactions actually form
+    a loop".
+
+    Runs over a deduplicated :TRANSACTED_WITH edge, NOT the raw :SENT
+    relationships directly — and this distinction matters a lot more
+    than it looks. write_transactions_batch() intentionally creates a
+    new :SENT relationship per (sender, receiver, window_start) for
+    idempotency, which means the same small ring of wallets accumulates
+    more and more *parallel* :SENT edges the longer the pipeline runs.
+    Cycle detection has to enumerate every combination of parallel edges
+    along a path, so with even a few dozen parallel edges per hop, a
+    3-8 hop search blows up combinatorially and can hang for a very
+    long time — this is not the query being slow, it's the query being
+    asked to do exponentially more work than it needs to. Collapsing
+    every wallet pair down to a single :TRANSACTED_WITH edge first turns
+    the search back into what it should be: a search over a small simple
+    graph, which is fast regardless of how much raw transaction history
+    has piled up.
+
+    First clears any stale flags from a previous run, then marks every
+    wallet that sits on at least one detected ring.
+    """
     session.run(
         "MATCH (w:Wallet) SET w.in_wash_ring = false, w.wash_ring_id = null"
     )
 
+    # Rebuild the deduplicated edge every run rather than incrementally
+    # maintaining it — clearing and re-deriving from :SENT is simpler,
+    # cheap at this graph's scale, and can never drift out of sync with
+    # whatever :SENT edges currently exist.
     session.run("MATCH ()-[r:TRANSACTED_WITH]->() DELETE r")
     session.run(
         "MATCH (a:Wallet)-[:SENT]->(b:Wallet) MERGE (a)-[:TRANSACTED_WITH]->(b)"
     )
 
+    # A hard timeout as a safety net, not a substitute for the dedup
+    # above — even a simple graph could in principle be large enough to
+    # make an 8-hop search slow, and a query that runs away shouldn't be
+    # able to hang the whole periodic refresh loop indefinitely.
     result = session.run(
         Query(
             f"""
@@ -198,6 +241,9 @@ def detect_wash_rings(session):
             ring_id=ring_id,
         )
 
+    return rings
+
+
 def main(drop_only=False):
     driver = get_neo4j_driver()
     with driver.session() as session:
@@ -219,7 +265,15 @@ def main(drop_only=False):
         run_fastrp(session)
 
         print(f"Detecting wash-trading rings ({MIN_RING_LENGTH}-{MAX_RING_LENGTH} hops)...")
-        rings = detect_wash_rings(session)
+        try:
+            rings = detect_wash_rings(session)
+        except Exception as e:
+            # A timeout or other failure here shouldn't take down
+            # PageRank/betweenness/Louvain/FastRP, which already
+            # succeeded and are worth keeping — log it and move on
+            # rather than losing everything this run computed.
+            print(f"[WARN] Wash-ring detection failed or timed out: {e}")
+            rings = []
 
         session.run(f"CALL gds.graph.drop('{GRAPH_NAME}', false)")
 

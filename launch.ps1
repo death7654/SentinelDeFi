@@ -2,6 +2,15 @@
 SentinelDeFi — full pipeline bootstrap (Windows / PowerShell), v2: Neo4j
 instead of Hive + Delta Lake.
 
+Project layout this script assumes (see README "Project Structure"):
+  pipeline/   all Python source
+  dashboard/  graph_dashboard.html
+  data/       wallet_profiles.csv (generated)
+  models/     isoforest_model.joblib + metadata (generated)
+  runtime/    metrics_state.json, eval_report.json, streaming checkpoints
+              (all generated; safe to delete for a clean slate)
+  docker-compose.yml, requirements.txt, .env, launch.ps1  — project root
+
 Run order:
   0. Load .env (NEO4J_PASSWORD etc.) into the process environment
   1. Check prerequisites (Java, winutils, Docker, Python packages)
@@ -125,12 +134,12 @@ if ($env:JAVA_HOME -and ($env:PATH -notlike "*$env:JAVA_HOME\bin*")) {
 #    model; skipped if isoforest_model.joblib already exists so restarts
 #    of the pipeline don't retrain from scratch every time for no reason)
 # ---------------------------------------------------------------------------
-$modelPath = Join-Path $ProjectRoot "isoforest_model.joblib"
+$modelPath = Join-Path $ProjectRoot "models\isoforest_model.joblib"
 if (Test-Path $modelPath) {
-    Write-Step "Isolation Forest model already exists, skipping training (delete isoforest_model.joblib to force a retrain)"
+    Write-Step "Isolation Forest model already exists, skipping training (delete models\isoforest_model.joblib to force a retrain)"
 } else {
     Write-Step "Training Isolation Forest model (isoforest_model.joblib not found)"
-    python "$ProjectRoot\train_isolation_forest.py"
+    python "$ProjectRoot\pipeline\train_isolation_forest.py"
     if ($LASTEXITCODE -ne 0) {
         throw "train_isolation_forest.py failed (exit $LASTEXITCODE)."
     }
@@ -200,13 +209,13 @@ docker exec kafka kafka-topics --describe --topic defi-transactions --bootstrap-
 # 7. Generate wallet profiles and load them into Neo4j
 # ---------------------------------------------------------------------------
 Write-Step "Generating synthetic wallet profiles"
-python "$ProjectRoot\generate_wallet_profiles.py"
+python "$ProjectRoot\pipeline\generate_wallet_profiles.py"
 if ($LASTEXITCODE -ne 0) {
     throw "generate_wallet_profiles.py failed (exit $LASTEXITCODE)."
 }
 
 Write-Step "Loading wallet profiles into Neo4j (and provisioning schema)"
-python "$ProjectRoot\load_wallet_profiles.py"
+python "$ProjectRoot\pipeline\load_wallet_profiles.py"
 if ($LASTEXITCODE -ne 0) {
     throw "load_wallet_profiles.py failed (exit $LASTEXITCODE)."
 }
@@ -215,7 +224,7 @@ if ($LASTEXITCODE -ne 0) {
 # 8. Sanity-check the broadcast join
 # ---------------------------------------------------------------------------
 Write-Step "Verifying broadcast hash join"
-python "$ProjectRoot\broadcast_engine.py"
+python "$ProjectRoot\pipeline\broadcast_engine.py"
 if ($LASTEXITCODE -ne 0) {
     throw "broadcast_engine.py failed (exit $LASTEXITCODE)."
 }
@@ -224,19 +233,19 @@ if ($LASTEXITCODE -ne 0) {
 # 9. Run graph analytics once (PageRank / betweenness / Louvain / FastRP / wash-ring detection)
 # ---------------------------------------------------------------------------
 Write-Step "Running initial graph analytics pass (PageRank, betweenness, Louvain, FastRP, wash-ring detection)"
-python "$ProjectRoot\graph_analytics.py"
+python "$ProjectRoot\pipeline\graph_analytics.py"
 if ($LASTEXITCODE -ne 0) {
     Write-Host "WARNING: graph_analytics.py failed. Confirm the GDS plugin loaded (docker logs neo4j)." -ForegroundColor Yellow
 }
 
 Write-Step "Launching periodic graph analytics refresh (every 2 minutes) in a new window"
-Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd '$ProjectRoot'; while (`$true) { python graph_analytics.py; Start-Sleep -Seconds 120 }"
+Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd '$ProjectRoot\pipeline'; while (`$true) { python graph_analytics.py; Start-Sleep -Seconds 120 }"
 
 # ---------------------------------------------------------------------------
 # 10. Launch the metrics API (FastAPI/uvicorn) in its own window
 # ---------------------------------------------------------------------------
 Write-Step "Launching metrics_api.py (FastAPI) in a new window"
-Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd '$ProjectRoot'; python -m uvicorn metrics_api:app --host 0.0.0.0 --port 8000"
+Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd '$ProjectRoot\pipeline'; python -m uvicorn metrics_api:app --host 0.0.0.0 --port 8000"
 
 Write-Step "Waiting for metrics API to become ready"
 $apiReady = $false
@@ -261,19 +270,19 @@ if (-not $apiReady) {
 # 11. Launch the producer and the streaming engine in their own windows
 # ---------------------------------------------------------------------------
 Write-Step "Launching transaction_generator.py in a new window"
-Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd '$ProjectRoot'; python transaction_generator.py"
+Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd '$ProjectRoot\pipeline'; python transaction_generator.py"
 
 Start-Sleep -Seconds 2
 
 Write-Step "Launching streaming_engine.py in a new window"
-Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd '$ProjectRoot'; python streaming_engine.py"
+Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd '$ProjectRoot\pipeline'; python streaming_engine.py"
 
 Write-Host "`nPipeline started. Four new windows are now running: metrics_api, the producer, the streaming engine, and the periodic graph analytics refresh." -ForegroundColor Green
 Write-Host "  Metrics API:      http://localhost:8000/metrics/summary" -ForegroundColor Green
 Write-Host "  Graph summary:    http://localhost:8000/graph/summary" -ForegroundColor Green
 Write-Host "  Wash rings:       http://localhost:8000/graph/wash-rings" -ForegroundColor Green
 Write-Host "  Top risk wallets: http://localhost:8000/graph/top-risk-wallets" -ForegroundColor Green
-Write-Host "  Live dashboard:   open graph_dashboard.html directly in a browser" -ForegroundColor Green
+Write-Host "  Live dashboard:   open dashboard\graph_dashboard.html directly in a browser" -ForegroundColor Green
 Write-Host "  Neo4j Browser:    http://localhost:7474  (see .env for credentials)" -ForegroundColor Green
 Write-Host "  Grafana:          http://localhost:3000  (admin / admin)" -ForegroundColor Green
-Write-Host "  Once some traffic has flowed, run 'python evaluate_model.py' for precision/recall against ground truth." -ForegroundColor Green
+Write-Host "  Once some traffic has flowed, run 'python pipeline\evaluate_model.py' for precision/recall against ground truth." -ForegroundColor Green
