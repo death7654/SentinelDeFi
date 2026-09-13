@@ -9,29 +9,8 @@ well any of it actually works.
 
 ## Architecture at a glance
 
-```
-transaction_generator.py --(Kafka: defi-transactions)--> streaming_engine.py
-                                                                |
-                                              1. windowed CEP rule engine
-                                              2. broadcast_engine.py (join vs. Neo4j:
-                                                 historical profile + live graph risk)
-                                              3. Isolation Forest scoring
-                                              4. write SENT edge to Neo4j (idempotent
-                                                 MERGE on window_start)
-                                              5. HTTP POST batch stats to metrics_api.py
-                                                                |
-                                    Neo4j graph (graph_storage.py)
-                                    (:Wallet)-[:SENT]->(:Wallet)
-                                       |                              |
-                          graph_analytics.py (periodic job,      metrics_api.py (FastAPI,
-                          GDS: PageRank, betweenness,             persists to
-                          Louvain, FastRP, cycle detection)       metrics_state.json)
-                          writes results back onto Wallet nodes        |        |
-                                       |                          Grafana   graph_dashboard.html
-                          evaluate_model.py — reads true_label
-                          back out of SENT edges, scores
-                          precision/recall/F1
-```
+<img width="1024" height="559" alt="image" src="https://github.com/user-attachments/assets/d6af0a08-f83a-4bb0-88be-87ea45e1303d" />
+
 
 `streaming_engine.py` is the core of the pipeline: it reads from Kafka, computes a
 per-(wallet, counterparty) sliding-window outlier statistic (CEP rules), joins in each
